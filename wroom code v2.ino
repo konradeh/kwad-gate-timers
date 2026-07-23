@@ -439,9 +439,14 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 void applyWiFiRobustness() {
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
-  // 80 = 20 dBm (units are 0.25 dBm). Near max without pushing into the
-  // range where current spikes can brown out a board on a weak USB supply.
-  esp_wifi_set_max_tx_power(80);
+  // 44 = 11 dBm (units are 0.25 dBm). Deliberately NOT max: cheap non-WROOM
+  // boards with weak 3.3V regulators brown out on the current spikes that
+  // max TX draws - most dangerous during the WPA 4-way handshake, which
+  // shows up as reason 2 (auth expired) / 204 (handshake timeout) drops
+  // even on a strong signal. Lower TX trades a little range for a stable
+  // rail. If a far node needs more reach, raise this and fix the power
+  // supply (a 470-1000uF cap across 5V/GND) rather than cranking TX blindly.
+  esp_wifi_set_max_tx_power(44);
 }
 
 // Connects to WiFi, retrying with a fresh WiFi.begin() call every 15s
