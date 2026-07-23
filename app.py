@@ -467,12 +467,28 @@ DEBUG_PANEL_HTML = """
         <div class="debug-log" id="debugLog"></div>
     </div>
     <script>
+        // Sub-second polling: fetches are cheap in-memory reads on the Pi,
+        // and this guard skips a tick if the previous fetch hasn't landed
+        // yet so a slow network hiccup can't pile up overlapping requests.
+        const DEBUG_POLL_MS = 150;
+        let debugTickInFlight = false;
+
+        function formatAge(ageSeconds) {
+            const ms = ageSeconds * 1000;
+            if (ms < 1000) return Math.round(ms) + 'ms ago';
+            return ageSeconds.toFixed(2) + 's ago';
+        }
+
         async function debugTick() {
+            if (debugTickInFlight) return;
+            debugTickInFlight = true;
+
             let data;
             try {
                 const res = await fetch('/api/debug');
                 data = await res.json();
             } catch (e) {
+                debugTickInFlight = false;
                 return;
             }
 
@@ -487,7 +503,7 @@ DEBUG_PANEL_HTML = """
                 row.innerHTML =
                     '<span class="debug-dot ' + (n.online ? 'online' : 'offline') + '"></span>' +
                     '<span class="debug-node-id">' + n.node_id + '</span>' +
-                    '<span class="debug-node-meta">' + n.age.toFixed(1) + 's ago &middot; ' + n.ip + '</span>';
+                    '<span class="debug-node-meta">' + formatAge(n.age) + ' &middot; ' + n.ip + '</span>';
                 nodesEl.appendChild(row);
             });
 
@@ -512,10 +528,12 @@ DEBUG_PANEL_HTML = """
                     '<strong>' + e.node_id + '</strong> ' + detail;
                 logEl.appendChild(row);
             });
+
+            debugTickInFlight = false;
         }
 
         debugTick();
-        setInterval(debugTick, 1500);
+        setInterval(debugTick, DEBUG_POLL_MS);
     </script>
 """
 
