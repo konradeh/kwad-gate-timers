@@ -32,6 +32,10 @@ raw_log_lock = threading.Lock()
 # checkpoint event) within this many seconds.
 NODE_ONLINE_TIMEOUT_S = 8.0
 
+# A node's live drone-proximity reading (piggybacked on its heartbeat) is
+# considered current if the sample is fresher than this, in milliseconds.
+DRONE_LIVE_TIMEOUT_MS = 3000
+
 def record_contact(node_id, kind, **extra):
     now = time.time()
     with node_registry_lock:
@@ -500,13 +504,26 @@ BASE_STYLE = """
 
         .debug-close:hover { color: var(--accent); border-color: var(--accent); }
 
+        .debug-drone {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 18px;
+            border-bottom: 1px solid var(--hairline);
+            font-size: 12px;
+            background: var(--bg);
+        }
+
         .debug-filter {
             padding: 12px 18px;
             border-bottom: 1px solid var(--hairline);
+            display: flex;
+            gap: 8px;
         }
 
         .debug-filter select {
-            width: 100%;
+            flex: 1;
+            min-width: 0;
             background: var(--bg);
             color: var(--paper);
             border: 1px solid var(--hairline);
@@ -534,6 +551,7 @@ BASE_STYLE = """
         .debug-node-row {
             display: flex;
             align-items: center;
+            flex-wrap: wrap;
             gap: 8px;
             padding: 6px 0;
             font-size: 12px;
@@ -552,6 +570,13 @@ BASE_STYLE = """
         .debug-node-id { flex: 1; }
 
         .debug-node-meta { color: var(--muted); font-size: 11px; }
+
+        .debug-drone-rssi {
+            width: 100%;
+            margin-top: 3px;
+            font-size: 11px;
+            color: var(--accent);
+        }
 
         .debug-log {
             flex: 1;
@@ -595,9 +620,14 @@ DEBUG_PANEL_HTML = """
             <div class="eyebrow">Node connectivity</div>
             <button class="debug-close" onclick="document.getElementById('debugPanel').classList.remove('open')">Close</button>
         </div>
+        <div class="debug-drone" id="debugDrone"></div>
         <div class="debug-filter">
             <select id="debugNodeFilter" onchange="debugTick()">
                 <option value="__all__">All checkpoints</option>
+            </select>
+            <select id="debugSortMode" onchange="debugTick()">
+                <option value="proximity">Sort: closest first</option>
+                <option value="node_id">Sort: node ID</option>
             </select>
         </div>
         <div class="debug-section" id="debugNodes">
@@ -619,6 +649,11 @@ DEBUG_PANEL_HTML = """
             return ageSeconds.toFixed(2) + 's ago';
         }
 
+        function formatMs(ms) {
+            if (ms < 1000) return Math.round(ms) + 'ms ago';
+            return (ms / 1000).toFixed(1) + 's ago';
+        }
+
         async function debugTick() {
             if (debugTickInFlight) return;
             debugTickInFlight = true;
@@ -632,6 +667,16 @@ DEBUG_PANEL_HTML = """
                 return;
             }
 
+            const droneEl = document.getElementById('debugDrone');
+            if (data.drone.online) {
+                droneEl.innerHTML =
+                    '<span class="debug-dot online"></span>' +
+                    '<span>Drone online &middot; closest to <strong>' + data.drone.closest_node +
+                    '</strong> (' + data.drone.closest_rssi + ' dBm)</span>';
+            } else {
+                droneEl.innerHTML = '<span class="debug-dot offline"></span><span>Drone offline &mdash; no recent beacon heard by any node</span>';
+            }
+
             const filterEl = document.getElementById('debugNodeFilter');
             const selected = filterEl.value || '__all__';
             const knownIds = data.nodes.map(n => n.node_id);
@@ -642,10 +687,24 @@ DEBUG_PANEL_HTML = """
                 filterEl.value = optionIds.includes(selected) || selected === '__all__' ? selected : '__all__';
             }
             const activeFilter = filterEl.value || '__all__';
+            const sortMode = document.getElementById('debugSortMode').value || 'proximity';
 
-            const visibleNodes = activeFilter === '__all__'
-                ? data.nodes
+            let visibleNodes = activeFilter === '__all__'
+                ? data.nodes.slice()
                 : data.nodes.filter(n => n.node_id === activeFilter);
+
+            if (sortMode === 'proximity') {
+                visibleNodes.sort((a, b) => {
+                    const aLive = a.drone_age_ms !== null && a.drone_age_ms <= 3000;
+                    const bLive = b.drone_age_ms !== null && b.drone_age_ms <= 3000;
+                    if (aLive && bLive) return b.drone_rssi - a.drone_rssi;
+                    if (aLive) return -1;
+                    if (bLive) return 1;
+                    return a.node_id.localeCompare(b.node_id);
+                });
+            } else {
+                visibleNodes.sort((a, b) => a.node_id.localeCompare(b.node_id));
+            }
 
             const nodesEl = document.getElementById('debugNodes');
             nodesEl.innerHTML = '<div class="debug-section-label">Nodes</div>';
@@ -655,10 +714,15 @@ DEBUG_PANEL_HTML = """
             visibleNodes.forEach(n => {
                 const row = document.createElement('div');
                 row.className = 'debug-node-row';
+                const droneLive = n.drone_age_ms !== null && n.drone_age_ms <= 3000;
+                const droneInfo = droneLive
+                    ? '<span class="debug-drone-rssi">drone ' + n.drone_rssi + ' dBm &middot; ' + formatMs(n.drone_age_ms) + '</span>'
+                    : '';
                 row.innerHTML =
                     '<span class="debug-dot ' + (n.online ? 'online' : 'offline') + '"></span>' +
                     '<span class="debug-node-id">' + n.node_id + '</span>' +
-                    '<span class="debug-node-meta">' + formatAge(n.age) + ' &middot; ' + n.ip + '</span>';
+                    '<span class="debug-node-meta">' + formatAge(n.age) + ' &middot; ' + n.ip + '</span>' +
+                    droneInfo;
                 nodesEl.appendChild(row);
             });
 
@@ -680,6 +744,9 @@ DEBUG_PANEL_HTML = """
                 } else if (e.kind === 'heartbeat') {
                     detail = e.detail.wifi_rssi !== null && e.detail.wifi_rssi !== undefined
                         ? 'wifi ' + e.detail.wifi_rssi + ' dBm' : '';
+                    if (e.detail.drone_rssi !== null && e.detail.drone_rssi !== undefined) {
+                        detail += ' &middot; drone ' + e.detail.drone_rssi + ' dBm';
+                    }
                 }
                 row.innerHTML =
                     '<span class="debug-log-time">' + e.time_str + '</span>' +
@@ -1332,7 +1399,14 @@ def heartbeat():
         return jsonify({"error": "expected JSON with a node_id field"}), 400
 
     wifi_rssi = data.get("wifi_rssi")
-    record_contact(node_id, "heartbeat", wifi_rssi=wifi_rssi)
+    extra = {"wifi_rssi": wifi_rssi}
+    # Live drone-proximity fields are only present once a node has actually
+    # heard an ESP-NOW beacon - not every heartbeat carries them.
+    if "drone_rssi" in data:
+        extra["drone_id"] = data.get("drone_id")
+        extra["drone_rssi"] = data.get("drone_rssi")
+        extra["drone_age_ms"] = data.get("drone_age_ms")
+    record_contact(node_id, "heartbeat", **extra)
 
     # Piggyback the node's current effective settings on the heartbeat
     # response instead of making firmware run a second, separate polling
@@ -1349,6 +1423,16 @@ def api_debug():
     with node_registry_lock:
         for node_id, state in sorted(node_registry.items()):
             age = now - state["last_seen"]
+
+            # drone_age_ms is how stale the sample already was when the
+            # node sent it; add time elapsed since the Pi received that
+            # heartbeat so this keeps counting up live between heartbeats,
+            # not just jump on each new one.
+            drone_age_ms = state.get("drone_age_ms")
+            live_drone_age_ms = None
+            if drone_age_ms is not None:
+                live_drone_age_ms = drone_age_ms + age * 1000
+
             nodes.append({
                 "node_id": node_id,
                 "online": age <= NODE_ONLINE_TIMEOUT_S,
@@ -1356,7 +1440,16 @@ def api_debug():
                 "last_type": state["last_type"],
                 "ip": state["ip"],
                 "wifi_rssi": state.get("wifi_rssi"),
+                "drone_id": state.get("drone_id"),
+                "drone_rssi": state.get("drone_rssi"),
+                "drone_age_ms": round(live_drone_age_ms) if live_drone_age_ms is not None else None,
             })
+
+    # A checkpoint has "live" drone proximity data if it heard an ESP-NOW
+    # sample recently - independent of whether that node's own heartbeat
+    # cadence still counts it "online" for connectivity purposes.
+    live_nodes = [n for n in nodes if n["drone_age_ms"] is not None and n["drone_age_ms"] <= DRONE_LIVE_TIMEOUT_MS]
+    closest_node = max(live_nodes, key=lambda n: n["drone_rssi"], default=None)
 
     with raw_log_lock:
         # Merge every node's own capped buffer into one time-sorted list.
@@ -1367,7 +1460,13 @@ def api_debug():
     merged.sort(key=lambda e: e["ts"], reverse=True)
     log = merged[:200]
 
-    return jsonify({"nodes": nodes, "log": log})
+    drone_status = {
+        "online": len(live_nodes) > 0,
+        "closest_node": closest_node["node_id"] if closest_node else None,
+        "closest_rssi": closest_node["drone_rssi"] if closest_node else None,
+    }
+
+    return jsonify({"nodes": nodes, "log": log, "drone": drone_status})
 
 @app.route("/settings")
 def settings_page():

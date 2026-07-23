@@ -78,6 +78,14 @@ QueueHandle_t httpQueue = nullptr;
 // Per-drone tracking state array (supports drone IDs 0-255)
 DroneState droneTrackers[256];
 
+// Most recent ESP-NOW sample from ANY drone, updated on every packet
+// regardless of pass-detection state. heartbeatTask reports this so the
+// site can show live proximity ("which node is the drone closest to right
+// now"), not just discrete pass events.
+uint8_t lastDroneId = 0;
+int8_t lastDroneRssi = -128;
+unsigned long lastDroneSampleMs = 0; // 0 = never received a sample
+
 // Interrupt Service Routine for ESP-NOW packet reception
 void IRAM_ATTR onEspNowReceive(const esp_now_recv_info_t* info,
                                const uint8_t* data, int length) {
@@ -178,6 +186,14 @@ void processSample(const ReceivedSample& sample) {
       sample.sequence == state.lastSequence) {
     return;
   }
+
+  // Record every sample as "live proximity" data, independent of whether
+  // it crosses the ENTER_RSSI/EXIT_RSSI pass-detection thresholds below.
+  // This is what lets the site show a continuous "how close is the drone"
+  // reading instead of only reporting once a full gate-pass completes.
+  lastDroneId = sample.drone_id;
+  lastDroneRssi = sample.rssi;
+  lastDroneSampleMs = sample.received_at_ms;
 
   state.haveLastBeacon = true;
   state.lastBootId = sample.boot_id;
@@ -325,7 +341,18 @@ void heartbeatTask(void* parameter) {
       http.addHeader("Content-Type", "application/json");
 
       String payload = String("{\"node_id\":\"") + NODE_ID +
-                        "\",\"wifi_rssi\":" + WiFi.RSSI() + "}";
+                        "\",\"wifi_rssi\":" + WiFi.RSSI();
+
+      // Only include live drone-proximity fields once a sample has
+      // actually been received - otherwise there's nothing meaningful to
+      // report yet (lastDroneSampleMs stays 0 until the first ESP-NOW
+      // packet arrives).
+      if (lastDroneSampleMs != 0) {
+        payload += String(",\"drone_id\":") + lastDroneId +
+                   ",\"drone_rssi\":" + lastDroneRssi +
+                   ",\"drone_age_ms\":" + (millis() - lastDroneSampleMs);
+      }
+      payload += "}";
 
       int httpCode = http.POST(payload);
       if (httpCode > 0) {
