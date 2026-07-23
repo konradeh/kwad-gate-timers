@@ -7,15 +7,15 @@ const char* WIFI_SSID = "superstuudio";
 const char* WIFI_PASSWORD = "sepikoda";
 const char* PI_IP = "192.168.1.213";
 const int PI_PORT = 5000;
-const char* NODE_ID = "checkpoint-1";
+const char* NODE_ID = "checkpoint-2";
 
 // ---- GATE TIMING & TUNING PARAMETERS ----
 const int8_t ENTER_RSSI = -62;           // Threshold to begin tracking a pass
 const int8_t EXIT_RSSI = -72;            // Threshold considered outside gate
-const uint8_t REQUIRED_WEAK_SAMPLES = 5; // Weak samples required to close pass
+const uint8_t REQUIRED_WEAK_SAMPLES = 15; // Weak samples required to close pass
 const unsigned long PASS_TIMEOUT_MS = 400; // Force-close pass if signal drops completely
 const unsigned long EVENT_COOLDOWN_MS = 2000; // Minimum time between valid passes per drone
-const unsigned long HEARTBEAT_INTERVAL_MS = 5000; // How often to tell the Pi this node is alive
+const unsigned long HEARTBEAT_INTERVAL_MS = 100; // How often to tell the Pi this node is alive
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;
@@ -260,6 +260,39 @@ void startEspNow() {
   Serial.printf("ESP-NOW listening on WiFi channel %d\n", WiFi.channel());
 }
 
+// Connects to WiFi, retrying with a fresh WiFi.begin() call every 15s
+// instead of hanging forever on a single attempt. Prints the numeric
+// WiFi.status() code on failure so a stuck node can be diagnosed from
+// Serial: 1 = SSID not found (out of range or typo), 4 = wrong password.
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    const unsigned long attemptStart = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - attemptStart < 15000) {
+      delay(400);
+      Serial.print(".");
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.printf("\nWiFi connect timed out (status=%d). Retrying...\n", WiFi.status());
+      WiFi.disconnect();
+      delay(1000);
+    }
+  }
+
+  Serial.println();
+  Serial.print("Connected! ESP32 Gateway IP: ");
+  Serial.println(WiFi.localIP());
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -290,21 +323,7 @@ void setup() {
       0
   );
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(400);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.print("Connected! ESP32 Gateway IP: ");
-  Serial.println(WiFi.localIP());
-
+  connectWiFi();
   startEspNow();
 }
 
