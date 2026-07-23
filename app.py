@@ -524,7 +524,6 @@ LEADERBOARD_PAGE = """
 <html>
 <head>
     <title>KWAD // Live Track</title>
-    <meta http-equiv="refresh" content="2">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta charset="UTF-8">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -551,19 +550,15 @@ LEADERBOARD_PAGE = """
             <div class="stats">
                 <div class="stat">
                     <div class="stat-label">Total passes</div>
-                    <div class="flap-row">
-                        {% for digit in '%03d'|format(count) %}
-                        <span class="flap-digit">{{ digit }}</span>
-                        {% endfor %}
-                    </div>
+                    <div class="flap-row" id="flapRow"></div>
                 </div>
                 <div class="stat">
                     <div class="stat-label">Last node</div>
-                    <div class="stat-value">{{ events[0].node_id if events else '—' }}</div>
+                    <div class="stat-value" id="lastNode">—</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label">Refresh interval</div>
-                    <div class="stat-value">2s</div>
+                    <div class="stat-value">Live</div>
                 </div>
             </div>
         </div>
@@ -574,26 +569,55 @@ LEADERBOARD_PAGE = """
                     <thead>
                         <tr><th>#</th><th>Node</th><th>Drone</th><th>RSSI</th><th>Sent</th><th>Received &middot; Pi</th></tr>
                     </thead>
-                    <tbody>
-                    {% for e in events %}
-                        <tr>
-                            <td class="idx">{{ '%02d'|format(loop.index) }}</td>
-                            <td><span class="node-pill">{{ e.node_id }}</span></td>
-                            <td>{{ e.drone_id }}</td>
-                            <td>{{ e.rssi }}</td>
-                            <td>{{ e.timestamp }}</td>
-                            <td>{{ e.received_at }}</td>
-                        </tr>
-                    {% endfor %}
-                    </tbody>
+                    <tbody id="eventsBody"></tbody>
                 </table>
             </div>
-            {% if not events %}
-            <div class="empty">Waiting for checkpoint signal &hellip;</div>
-            {% endif %}
+            <div class="empty" id="emptyState" style="display:none;">Waiting for checkpoint signal &hellip;</div>
         </div>
     </div>
 """ + DEBUG_PANEL_HTML + """
+    <script>
+        const flapRowEl = document.getElementById('flapRow');
+        const lastNodeEl = document.getElementById('lastNode');
+        const bodyEl = document.getElementById('eventsBody');
+        const emptyEl = document.getElementById('emptyState');
+
+        function esc(s) {
+            return String(s).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
+        async function leaderboardTick() {
+            let data;
+            try {
+                const res = await fetch('/api/leaderboard');
+                data = await res.json();
+            } catch (e) {
+                return;
+            }
+
+            const digits = String(data.count).padStart(3, '0').split('');
+            flapRowEl.innerHTML = digits.map(d => '<span class="flap-digit">' + d + '</span>').join('');
+
+            lastNodeEl.textContent = data.events.length ? data.events[0].node_id : '—';
+
+            emptyEl.style.display = data.events.length ? 'none' : 'block';
+            bodyEl.innerHTML = data.events.map((e, i) => (
+                '<tr>' +
+                '<td class="idx">' + String(i + 1).padStart(2, '0') + '</td>' +
+                '<td><span class="node-pill">' + esc(e.node_id) + '</span></td>' +
+                '<td>' + esc(e.drone_id) + '</td>' +
+                '<td>' + esc(e.rssi) + '</td>' +
+                '<td>' + esc(e.timestamp) + '</td>' +
+                '<td>' + esc(e.received_at) + '</td>' +
+                '</tr>'
+            )).join('');
+        }
+
+        leaderboardTick();
+        setInterval(leaderboardTick, 1000);
+    </script>
 </body>
 </html>
 """
@@ -796,10 +820,14 @@ RADAR_PAGE = """
 
 @app.route("/")
 def leaderboard():
+    return render_template_string(LEADERBOARD_PAGE)
+
+@app.route("/api/leaderboard")
+def api_leaderboard():
     with events_lock:
         # show most recent first
         recent = list(reversed(events))
-    return render_template_string(LEADERBOARD_PAGE, events=recent, count=len(events))
+    return jsonify({"events": recent, "count": len(events)})
 
 @app.route("/radar")
 def radar():
