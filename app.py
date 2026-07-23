@@ -53,8 +53,11 @@ drone_state_lock = threading.Lock()
 # Where each checkpoint node sits on the radar square, as a percentage
 # (0-100) from the top-left. Edit this to match your physical track layout.
 NODE_POSITIONS = {
-    "checkpoint-1": (18, 50),
-    "checkpoint-2": (82, 50),
+    "checkpoint-1": (50.0, 15.0),
+    "checkpoint-2": (83.3, 39.2),
+    "checkpoint-3": (70.6, 78.3),
+    "checkpoint-4": (29.4, 78.3),
+    "checkpoint-5": (16.7, 39.2),
 }
 
 # Any node_id not listed above gets placed automatically on a circle so it
