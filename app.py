@@ -578,6 +578,18 @@ BASE_STYLE = """
             color: var(--accent);
         }
 
+        .closest-badge {
+            display: inline-block;
+            font-size: 9px;
+            letter-spacing: 1px;
+            font-weight: 700;
+            color: #08130c;
+            background: var(--accent);
+            padding: 1px 5px;
+            margin-left: 4px;
+            border-radius: 2px;
+        }
+
         .debug-log {
             flex: 1;
             overflow-y: auto;
@@ -715,8 +727,10 @@ DEBUG_PANEL_HTML = """
                 const row = document.createElement('div');
                 row.className = 'debug-node-row';
                 const droneLive = n.drone_age_ms !== null && n.drone_age_ms <= 3000;
+                const isClosest = data.drone.online && n.node_id === data.drone.closest_node;
                 const droneInfo = droneLive
-                    ? '<span class="debug-drone-rssi">drone ' + n.drone_rssi + ' dBm &middot; ' + formatMs(n.drone_age_ms) + '</span>'
+                    ? '<span class="debug-drone-rssi">drone ' + n.drone_rssi + ' dBm &middot; ' + formatMs(n.drone_age_ms) +
+                      (isClosest ? ' <span class="closest-badge">CLOSEST</span>' : '') + '</span>'
                     : '';
                 row.innerHTML =
                     '<span class="debug-dot ' + (n.online ? 'online' : 'offline') + '"></span>' +
