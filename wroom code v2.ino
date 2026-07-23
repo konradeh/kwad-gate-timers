@@ -7,7 +7,7 @@
 // it. Reported on every heartbeat so the site's debug panel can show which
 // firmware version each physical node is actually running - no more
 // guessing which boards still need a reflash by diffing behavior.
-const char* FW_VERSION = "1.2.0";
+const char* FW_VERSION = "1.2.1";
 
 // ---- NETWORK CONFIGURATION ----
 const char* WIFI_SSID = "superstuudio";
@@ -418,9 +418,14 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       lastDisconnectReason = info.wifi_sta_disconnected.reason;
       disconnectCount++;
-      Serial.printf("[WiFi] Dropped (reason %d). Reconnecting...\n",
+      // Do NOT call WiFi.reconnect() here. This event fires repeatedly
+      // WHILE the driver is already trying to (re)connect, and calling
+      // reconnect() on top of an in-progress attempt aborts it with
+      // "sta is connecting, return error", which just thrashes the
+      // handshake for many seconds. setAutoReconnect(true) already retries
+      // automatically, and wifiWatchdogTask is the backstop if that stalls.
+      Serial.printf("[WiFi] Dropped (reason %d).\n",
                     info.wifi_sta_disconnected.reason);
-      WiFi.reconnect();
       break;
     default:
       break;
@@ -483,14 +488,19 @@ void wifiWatchdogTask(void* parameter) {
   while (true) {
     if (WiFi.status() == WL_CONNECTED) {
       lastWiFiConnectedMs = millis();
-    } else if (millis() - lastWiFiConnectedMs > 5000) {
-      Serial.println("[WiFi Watchdog] Down >5s, forcing full reconnect.");
+    } else if (millis() - lastWiFiConnectedMs > 10000) {
+      // Only step in after 10s down - long enough that we're sure the
+      // driver's own auto-reconnect has stalled rather than just being
+      // mid-handshake. disconnect() first clears any in-progress attempt so
+      // begin() doesn't hit "sta is connecting, return error".
+      Serial.println("[WiFi Watchdog] Down >10s, forcing full reconnect.");
       WiFi.disconnect();
+      vTaskDelay(pdMS_TO_TICKS(300));
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       applyWiFiRobustness();
       lastWiFiConnectedMs = millis(); // give this cycle time before forcing another
     }
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
