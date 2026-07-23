@@ -15,7 +15,13 @@ const int8_t EXIT_RSSI = -72;            // Threshold considered outside gate
 const uint8_t REQUIRED_WEAK_SAMPLES = 15; // Weak samples required to close pass
 const unsigned long PASS_TIMEOUT_MS = 400; // Force-close pass if signal drops completely
 const unsigned long EVENT_COOLDOWN_MS = 2000; // Minimum time between valid passes per drone
-const unsigned long HEARTBEAT_INTERVAL_MS = 100; // How often to tell the Pi this node is alive
+const unsigned long HEARTBEAT_INTERVAL_MS = 1000; // How often to tell the Pi this node is alive.
+// Keep this >= ~1000ms. The debug panel already polls the Pi every 150ms
+// on its own, so a faster heartbeat doesn't make the UI feel more live -
+// it just multiplies TCP connection churn per node. At 100ms (10 req/s,
+// each a fresh handshake, no keep-alive) a weak-signal board doesn't get
+// enough time between requests to recover from packet loss, which is what
+// was causing "read Timeout" / "connection refused" cascades.
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;
@@ -107,6 +113,8 @@ void httpTask(void* parameter) {
       String url = String("http://") + PI_IP + ":" + PI_PORT + "/checkpoint";
 
       http.begin(url);
+      http.setConnectTimeout(3000);
+      http.setTimeout(3000);
       http.addHeader("Content-Type", "application/json");
 
       String payload = String("{\"node_id\":\"") + NODE_ID +
@@ -228,6 +236,8 @@ void heartbeatTask(void* parameter) {
       String url = String("http://") + PI_IP + ":" + PI_PORT + "/api/heartbeat";
 
       http.begin(url);
+      http.setConnectTimeout(3000);
+      http.setTimeout(3000);
       http.addHeader("Content-Type", "application/json");
 
       String payload = String("{\"node_id\":\"") + NODE_ID +

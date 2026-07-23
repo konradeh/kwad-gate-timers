@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, render_template_string
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime
 import hashlib
 import math
@@ -18,9 +18,10 @@ events_lock = threading.Lock()
 node_registry = {}
 node_registry_lock = threading.Lock()
 
-# Rolling log of every request that touched /checkpoint or /api/heartbeat,
-# newest last. Shown raw in the debug panel.
-raw_log = deque(maxlen=50)
+# Rolling log of requests, kept PER NODE (not one shared buffer) so a node
+# heartbeating fast can't crowd another node's entries out of view. Each
+# node gets its own capped history; the debug panel merges/filters them.
+raw_log_by_node = defaultdict(lambda: deque(maxlen=30))
 raw_log_lock = threading.Lock()
 
 # A node is considered "online" if we've heard from it (heartbeat or
@@ -37,7 +38,8 @@ def record_contact(node_id, kind, **extra):
             **extra,
         }
     with raw_log_lock:
-        raw_log.append({
+        raw_log_by_node[node_id].append({
+            "ts": now,
             "time_str": datetime.now().strftime("%H:%M:%S.%f")[:-3],
             "node_id": node_id,
             "kind": kind,
@@ -385,6 +387,23 @@ BASE_STYLE = """
 
         .debug-close:hover { color: var(--accent); border-color: var(--accent); }
 
+        .debug-filter {
+            padding: 12px 18px;
+            border-bottom: 1px solid var(--hairline);
+        }
+
+        .debug-filter select {
+            width: 100%;
+            background: var(--bg);
+            color: var(--paper);
+            border: 1px solid var(--hairline);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            padding: 7px 8px;
+        }
+
+        .debug-filter select:focus { outline: none; border-color: var(--accent); }
+
         .debug-section {
             padding: 14px 18px;
             border-bottom: 1px solid var(--hairline);
@@ -463,6 +482,11 @@ DEBUG_PANEL_HTML = """
             <div class="eyebrow">Node connectivity</div>
             <button class="debug-close" onclick="document.getElementById('debugPanel').classList.remove('open')">Close</button>
         </div>
+        <div class="debug-filter">
+            <select id="debugNodeFilter" onchange="debugTick()">
+                <option value="__all__">All checkpoints</option>
+            </select>
+        </div>
         <div class="debug-section" id="debugNodes">
             <div class="debug-section-label">Nodes</div>
         </div>
@@ -495,12 +519,27 @@ DEBUG_PANEL_HTML = """
                 return;
             }
 
+            const filterEl = document.getElementById('debugNodeFilter');
+            const selected = filterEl.value || '__all__';
+            const knownIds = data.nodes.map(n => n.node_id);
+            const optionIds = Array.from(filterEl.options).map(o => o.value);
+            if (optionIds.length !== knownIds.length + 1 || knownIds.some(id => !optionIds.includes(id))) {
+                filterEl.innerHTML = '<option value="__all__">All checkpoints</option>' +
+                    knownIds.map(id => '<option value="' + id + '">' + id + '</option>').join('');
+                filterEl.value = optionIds.includes(selected) || selected === '__all__' ? selected : '__all__';
+            }
+            const activeFilter = filterEl.value || '__all__';
+
+            const visibleNodes = activeFilter === '__all__'
+                ? data.nodes
+                : data.nodes.filter(n => n.node_id === activeFilter);
+
             const nodesEl = document.getElementById('debugNodes');
             nodesEl.innerHTML = '<div class="debug-section-label">Nodes</div>';
-            if (data.nodes.length === 0) {
+            if (visibleNodes.length === 0) {
                 nodesEl.innerHTML += '<div class="debug-empty">No nodes have contacted the server yet.</div>';
             }
-            data.nodes.forEach(n => {
+            visibleNodes.forEach(n => {
                 const row = document.createElement('div');
                 row.className = 'debug-node-row';
                 row.innerHTML =
@@ -510,12 +549,16 @@ DEBUG_PANEL_HTML = """
                 nodesEl.appendChild(row);
             });
 
+            const visibleLog = activeFilter === '__all__'
+                ? data.log
+                : data.log.filter(e => e.node_id === activeFilter);
+
             const logEl = document.getElementById('debugLog');
             logEl.innerHTML = '';
-            if (data.log.length === 0) {
+            if (visibleLog.length === 0) {
                 logEl.innerHTML = '<div class="debug-empty">No requests logged yet.</div>';
             }
-            data.log.forEach(e => {
+            visibleLog.slice(0, 60).forEach(e => {
                 const row = document.createElement('div');
                 row.className = 'debug-log-row';
                 let detail = '';
@@ -959,7 +1002,13 @@ def api_debug():
             })
 
     with raw_log_lock:
-        log = list(reversed(raw_log))
+        # Merge every node's own capped buffer into one time-sorted list.
+        # Because each node has its own deque, a fast-heartbeating node
+        # can no longer push a slower node's entries out of the response.
+        merged = [entry for entries in raw_log_by_node.values() for entry in entries]
+
+    merged.sort(key=lambda e: e["ts"], reverse=True)
+    log = merged[:200]
 
     return jsonify({"nodes": nodes, "log": log})
 
