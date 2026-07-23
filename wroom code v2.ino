@@ -2,6 +2,12 @@
 #include <HTTPClient.h>
 #include <esp_now.h>
 
+// Bump this whenever this file changes and reflash every board that needs
+// it. Reported on every heartbeat so the site's debug panel can show which
+// firmware version each physical node is actually running - no more
+// guessing which boards still need a reflash by diffing behavior.
+const char* FW_VERSION = "1.0.0";
+
 // ---- NETWORK CONFIGURATION ----
 const char* WIFI_SSID = "superstuudio";
 const char* WIFI_PASSWORD = "sepikoda";
@@ -341,6 +347,7 @@ void heartbeatTask(void* parameter) {
       http.addHeader("Content-Type", "application/json");
 
       String payload = String("{\"node_id\":\"") + NODE_ID +
+                        "\",\"fw_version\":\"" + FW_VERSION +
                         "\",\"wifi_rssi\":" + WiFi.RSSI();
 
       // Only include live drone-proximity fields once a sample has
@@ -418,6 +425,11 @@ void connectWiFi() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  Serial.print("Firmware version: ");
+  Serial.println(FW_VERSION);
+  Serial.print("Node ID: ");
+  Serial.println(NODE_ID);
 
   // Pre-allocate FreeRTOS Queues
   sampleQueue = xQueueCreate(64, sizeof(ReceivedSample));

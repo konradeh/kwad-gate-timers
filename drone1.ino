@@ -2,6 +2,12 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 
+// Bump this whenever this file changes and reflash the board. This file
+// never talks to the Pi over HTTP (ESP-NOW broadcast only), so unlike the
+// checkpoint firmware this version can't be reported automatically -
+// check it via the serial monitor if you need to confirm what's flashed.
+const char* FW_VERSION = "1.0.0";
+
 // Must match the WiFi network used by the receiver gateway.
 const char* CHECKPOINT_WIFI_SSID = "superstuudio";
 
@@ -66,6 +72,9 @@ void addBroadcastPeer() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  Serial.print("Firmware version: ");
+  Serial.println(FW_VERSION);
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();

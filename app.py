@@ -39,7 +39,12 @@ DRONE_LIVE_TIMEOUT_MS = 3000
 def record_contact(node_id, kind, **extra):
     now = time.time()
     with node_registry_lock:
+        # Merge onto the previous entry rather than replacing it outright -
+        # a /checkpoint pass event doesn't carry wifi_rssi/fw_version, and
+        # a plain replace would wipe those out until the next heartbeat.
+        previous = node_registry.get(node_id, {})
         node_registry[node_id] = {
+            **previous,
             "last_seen": now,
             "last_type": kind,
             "ip": request.remote_addr,
@@ -578,6 +583,21 @@ BASE_STYLE = """
             color: var(--accent);
         }
 
+        .fw-badge {
+            display: inline-block;
+            font-size: 9px;
+            letter-spacing: 0.5px;
+            color: var(--muted);
+            border: 1px solid var(--hairline);
+            padding: 1px 5px;
+            border-radius: 2px;
+        }
+
+        .fw-badge.fw-unknown {
+            color: #ff6f59;
+            border-color: #ff6f59;
+        }
+
         .closest-badge {
             display: inline-block;
             font-size: 9px;
@@ -732,9 +752,13 @@ DEBUG_PANEL_HTML = """
                     ? '<span class="debug-drone-rssi">drone ' + n.drone_rssi + ' dBm &middot; ' + formatMs(n.drone_age_ms) +
                       (isClosest ? ' <span class="closest-badge">CLOSEST</span>' : '') + '</span>'
                     : '';
+                const fwBadge = n.fw_version
+                    ? '<span class="fw-badge">fw ' + n.fw_version + '</span>'
+                    : '<span class="fw-badge fw-unknown">fw ?</span>';
                 row.innerHTML =
                     '<span class="debug-dot ' + (n.online ? 'online' : 'offline') + '"></span>' +
                     '<span class="debug-node-id">' + n.node_id + '</span>' +
+                    fwBadge +
                     '<span class="debug-node-meta">' + formatAge(n.age) + ' &middot; ' + n.ip + '</span>' +
                     droneInfo;
                 nodesEl.appendChild(row);
@@ -1413,7 +1437,7 @@ def heartbeat():
         return jsonify({"error": "expected JSON with a node_id field"}), 400
 
     wifi_rssi = data.get("wifi_rssi")
-    extra = {"wifi_rssi": wifi_rssi}
+    extra = {"wifi_rssi": wifi_rssi, "fw_version": data.get("fw_version")}
     # Live drone-proximity fields are only present once a node has actually
     # heard an ESP-NOW beacon - not every heartbeat carries them.
     if "drone_rssi" in data:
@@ -1454,6 +1478,7 @@ def api_debug():
                 "last_type": state["last_type"],
                 "ip": state["ip"],
                 "wifi_rssi": state.get("wifi_rssi"),
+                "fw_version": state.get("fw_version"),
                 "drone_id": state.get("drone_id"),
                 "drone_rssi": state.get("drone_rssi"),
                 "drone_age_ms": round(live_drone_age_ms) if live_drone_age_ms is not None else None,
