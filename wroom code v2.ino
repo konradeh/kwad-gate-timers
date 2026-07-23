@@ -15,6 +15,7 @@ const int8_t EXIT_RSSI = -72;            // Threshold considered outside gate
 const uint8_t REQUIRED_WEAK_SAMPLES = 5; // Weak samples required to close pass
 const unsigned long PASS_TIMEOUT_MS = 400; // Force-close pass if signal drops completely
 const unsigned long EVENT_COOLDOWN_MS = 2000; // Minimum time between valid passes per drone
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000; // How often to tell the Pi this node is alive
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;
@@ -217,6 +218,36 @@ void checkActiveTimeouts() {
   }
 }
 
+// Background task that pings the Pi's /api/heartbeat endpoint on a fixed
+// interval, independent of drone activity, so the debug panel can tell
+// this node is alive even when no drone has passed recently.
+void heartbeatTask(void* parameter) {
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String url = String("http://") + PI_IP + ":" + PI_PORT + "/api/heartbeat";
+
+      http.begin(url);
+      http.addHeader("Content-Type", "application/json");
+
+      String payload = String("{\"node_id\":\"") + NODE_ID +
+                        "\",\"wifi_rssi\":" + WiFi.RSSI() + "}";
+
+      int httpCode = http.POST(payload);
+      if (httpCode > 0) {
+        Serial.printf("[Heartbeat] OK (%d)\n", httpCode);
+      } else {
+        Serial.printf("[Heartbeat] Failed: %s\n", http.errorToString(httpCode).c_str());
+      }
+      http.end();
+    } else {
+      Serial.println("[Heartbeat] WiFi disconnected, skipping.");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));
+  }
+}
+
 void startEspNow() {
   if (esp_now_init() != ESP_OK) {
     Serial.println("FATAL: ESP-NOW initialization failed");
@@ -241,6 +272,17 @@ void setup() {
   xTaskCreatePinnedToCore(
       httpTask,
       "HTTP_Task",
+      4096,
+      nullptr,
+      1,
+      nullptr,
+      0
+  );
+
+  // Spawn periodic heartbeat task on Core 0
+  xTaskCreatePinnedToCore(
+      heartbeatTask,
+      "Heartbeat_Task",
       4096,
       nullptr,
       1,

@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, render_template_string
+from collections import deque
 from datetime import datetime
 import hashlib
 import math
@@ -10,6 +11,39 @@ app = Flask(__name__)
 # In-memory event log - list of dicts: {node_id, timestamp, received_at, drone_id, rssi}
 events = []
 events_lock = threading.Lock()
+
+# Last-contact registry per node_id, updated by both /checkpoint and
+# /api/heartbeat. This is what powers the debug panel's online/offline dots.
+# {"checkpoint-1": {"last_seen": <epoch>, "last_type": "heartbeat", "ip": "...", "wifi_rssi": -50}}
+node_registry = {}
+node_registry_lock = threading.Lock()
+
+# Rolling log of every request that touched /checkpoint or /api/heartbeat,
+# newest last. Shown raw in the debug panel.
+raw_log = deque(maxlen=50)
+raw_log_lock = threading.Lock()
+
+# A node is considered "online" if we've heard from it (heartbeat or
+# checkpoint event) within this many seconds.
+NODE_ONLINE_TIMEOUT_S = 8.0
+
+def record_contact(node_id, kind, **extra):
+    now = time.time()
+    with node_registry_lock:
+        node_registry[node_id] = {
+            "last_seen": now,
+            "last_type": kind,
+            "ip": request.remote_addr,
+            **extra,
+        }
+    with raw_log_lock:
+        raw_log.append({
+            "time_str": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "node_id": node_id,
+            "kind": kind,
+            "ip": request.remote_addr,
+            "detail": extra,
+        })
 
 # Latest known state per drone, keyed by drone_id (as string).
 # {"1": {"node_id": "checkpoint-1", "rssi": -58, "last_seen": <epoch>, "sequence": 123}}
@@ -286,6 +320,203 @@ BASE_STYLE = """
             font-size: 12px;
             border: 1px dashed var(--hairline);
         }
+
+        .debug-tab {
+            position: fixed;
+            top: 50%;
+            right: 0;
+            transform: translateY(-50%);
+            writing-mode: vertical-rl;
+            background: var(--panel);
+            border: 1px solid var(--hairline);
+            border-right: none;
+            color: var(--muted);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            padding: 14px 8px;
+            cursor: pointer;
+            z-index: 30;
+        }
+
+        .debug-tab:hover { color: var(--accent); border-color: var(--accent); }
+
+        .debug-panel {
+            position: fixed;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: 340px;
+            max-width: 90vw;
+            background: var(--panel);
+            border-left: 1px solid var(--hairline);
+            transform: translateX(100%);
+            transition: transform 0.25s ease;
+            z-index: 40;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .debug-panel.open { transform: translateX(0); }
+
+        .debug-header {
+            padding: 18px 18px 14px;
+            border-bottom: 1px solid var(--hairline);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .debug-header .eyebrow { margin: 0; }
+
+        .debug-close {
+            background: none;
+            border: 1px solid var(--hairline);
+            color: var(--muted);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            padding: 4px 9px;
+            cursor: pointer;
+        }
+
+        .debug-close:hover { color: var(--accent); border-color: var(--accent); }
+
+        .debug-section {
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--hairline);
+            overflow-y: auto;
+        }
+
+        .debug-section-label {
+            font-size: 10px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin-bottom: 10px;
+        }
+
+        .debug-node-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 0;
+            font-size: 12px;
+        }
+
+        .debug-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .debug-dot.online { background: #7fc93f; box-shadow: 0 0 5px #7fc93f; }
+        .debug-dot.offline { background: #e04f4f; box-shadow: 0 0 5px #e04f4f; }
+
+        .debug-node-id { flex: 1; }
+
+        .debug-node-meta { color: var(--muted); font-size: 11px; }
+
+        .debug-log {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px 18px;
+            font-size: 11px;
+        }
+
+        .debug-log-row {
+            padding: 7px 0;
+            border-bottom: 1px solid var(--hairline);
+            line-height: 1.5;
+        }
+
+        .debug-log-time { color: var(--muted); }
+
+        .debug-log-kind {
+            display: inline-block;
+            padding: 1px 6px;
+            margin-left: 6px;
+            font-size: 10px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            border: 1px solid var(--hairline);
+        }
+
+        .debug-log-kind.checkpoint { color: var(--accent); border-color: var(--accent); }
+        .debug-log-kind.heartbeat { color: #3fb3c9; border-color: #3fb3c9; }
+
+        .debug-empty {
+            color: var(--muted);
+            font-size: 12px;
+            padding: 8px 0;
+        }
+"""
+
+DEBUG_PANEL_HTML = """
+    <div class="debug-tab" onclick="document.getElementById('debugPanel').classList.add('open')">Debug</div>
+    <div class="debug-panel" id="debugPanel">
+        <div class="debug-header">
+            <div class="eyebrow">Node connectivity</div>
+            <button class="debug-close" onclick="document.getElementById('debugPanel').classList.remove('open')">Close</button>
+        </div>
+        <div class="debug-section" id="debugNodes">
+            <div class="debug-section-label">Nodes</div>
+        </div>
+        <div class="debug-section-label" style="padding: 12px 18px 0;">Raw request log</div>
+        <div class="debug-log" id="debugLog"></div>
+    </div>
+    <script>
+        async function debugTick() {
+            let data;
+            try {
+                const res = await fetch('/api/debug');
+                data = await res.json();
+            } catch (e) {
+                return;
+            }
+
+            const nodesEl = document.getElementById('debugNodes');
+            nodesEl.innerHTML = '<div class="debug-section-label">Nodes</div>';
+            if (data.nodes.length === 0) {
+                nodesEl.innerHTML += '<div class="debug-empty">No nodes have contacted the server yet.</div>';
+            }
+            data.nodes.forEach(n => {
+                const row = document.createElement('div');
+                row.className = 'debug-node-row';
+                row.innerHTML =
+                    '<span class="debug-dot ' + (n.online ? 'online' : 'offline') + '"></span>' +
+                    '<span class="debug-node-id">' + n.node_id + '</span>' +
+                    '<span class="debug-node-meta">' + n.age.toFixed(1) + 's ago &middot; ' + n.ip + '</span>';
+                nodesEl.appendChild(row);
+            });
+
+            const logEl = document.getElementById('debugLog');
+            logEl.innerHTML = '';
+            if (data.log.length === 0) {
+                logEl.innerHTML = '<div class="debug-empty">No requests logged yet.</div>';
+            }
+            data.log.forEach(e => {
+                const row = document.createElement('div');
+                row.className = 'debug-log-row';
+                let detail = '';
+                if (e.kind === 'checkpoint') {
+                    detail = 'drone ' + e.detail.drone_id + ' &middot; ' + e.detail.rssi + ' dBm';
+                } else if (e.kind === 'heartbeat') {
+                    detail = e.detail.wifi_rssi !== null && e.detail.wifi_rssi !== undefined
+                        ? 'wifi ' + e.detail.wifi_rssi + ' dBm' : '';
+                }
+                row.innerHTML =
+                    '<span class="debug-log-time">' + e.time_str + '</span>' +
+                    '<span class="debug-log-kind ' + e.kind + '">' + e.kind + '</span><br>' +
+                    '<strong>' + e.node_id + '</strong> ' + detail;
+                logEl.appendChild(row);
+            });
+        }
+
+        debugTick();
+        setInterval(debugTick, 1500);
+    </script>
 """
 
 LEADERBOARD_PAGE = """
@@ -362,6 +593,7 @@ LEADERBOARD_PAGE = """
             {% endif %}
         </div>
     </div>
+""" + DEBUG_PANEL_HTML + """
 </body>
 </html>
 """
@@ -557,6 +789,7 @@ RADAR_PAGE = """
         tick();
         setInterval(tick, 400);
     </script>
+""" + DEBUG_PANEL_HTML + """
 </body>
 </html>
 """
@@ -642,8 +875,44 @@ def checkpoint():
                 "sequence": data.get("sequence"),
             }
 
+    record_contact(node_id, "checkpoint", drone_id=drone_id, rssi=event["rssi"])
+
     print(f"[checkpoint] {event}")
     return jsonify({"status": "ok", "event": event}), 200
+
+@app.route("/api/heartbeat", methods=["POST"])
+def heartbeat():
+    data = request.get_json(force=True, silent=True) or {}
+    node_id = data.get("node_id")
+    if not node_id:
+        return jsonify({"error": "expected JSON with a node_id field"}), 400
+
+    wifi_rssi = data.get("wifi_rssi")
+    record_contact(node_id, "heartbeat", wifi_rssi=wifi_rssi)
+
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/api/debug")
+def api_debug():
+    now = time.time()
+
+    nodes = []
+    with node_registry_lock:
+        for node_id, state in sorted(node_registry.items()):
+            age = now - state["last_seen"]
+            nodes.append({
+                "node_id": node_id,
+                "online": age <= NODE_ONLINE_TIMEOUT_S,
+                "age": round(age, 1),
+                "last_type": state["last_type"],
+                "ip": state["ip"],
+                "wifi_rssi": state.get("wifi_rssi"),
+            })
+
+    with raw_log_lock:
+        log = list(reversed(raw_log))
+
+    return jsonify({"nodes": nodes, "log": log})
 
 @app.route("/health")
 def health():
