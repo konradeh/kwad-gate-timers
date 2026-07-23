@@ -36,6 +36,31 @@ NODE_ONLINE_TIMEOUT_S = 8.0
 # considered current if the sample is fresher than this, in milliseconds.
 DRONE_LIVE_TIMEOUT_MS = 3000
 
+# ESP32 WiFi disconnect reason codes -> human labels, so the debug panel can
+# explain WHY a node dropped instead of just showing a bare number. Only the
+# common ones are mapped; anything else falls back to "reason N".
+WIFI_DISCONNECT_REASONS = {
+    1: "unspecified",
+    2: "auth expired",
+    3: "auth leave",
+    4: "assoc expired (idle/kicked)",
+    5: "too many assoc",
+    6: "not authed",
+    7: "not assoced",
+    8: "assoc leave (AP kicked it)",
+    15: "4-way handshake timeout",
+    200: "beacon timeout (weak signal)",
+    201: "no AP found (out of range/channel)",
+    202: "auth fail",
+    203: "assoc fail",
+    204: "handshake timeout",
+}
+
+def disconnect_reason_label(reason):
+    if reason is None or reason == 0:
+        return None
+    return WIFI_DISCONNECT_REASONS.get(reason, f"reason {reason}")
+
 def record_contact(node_id, kind, **extra):
     now = time.time()
     with node_registry_lock:
@@ -583,6 +608,13 @@ BASE_STYLE = """
             color: var(--accent);
         }
 
+        .debug-drop-info {
+            width: 100%;
+            margin-top: 3px;
+            font-size: 11px;
+            color: #ff6f59;
+        }
+
         .fw-badge {
             display: inline-block;
             font-size: 9px;
@@ -755,12 +787,17 @@ DEBUG_PANEL_HTML = """
                 const fwBadge = n.fw_version
                     ? '<span class="fw-badge">fw ' + n.fw_version + '</span>'
                     : '<span class="fw-badge fw-unknown">fw ?</span>';
+                const dropInfo = (n.disconnect_count)
+                    ? '<span class="debug-drop-info">dropped ' + n.disconnect_count + '&times;' +
+                      (n.last_disc_label ? ' &middot; last: ' + n.last_disc_label : '') + '</span>'
+                    : '';
                 row.innerHTML =
                     '<span class="debug-dot ' + (n.online ? 'online' : 'offline') + '"></span>' +
                     '<span class="debug-node-id">' + n.node_id + '</span>' +
                     fwBadge +
                     '<span class="debug-node-meta">' + formatAge(n.age) + ' &middot; ' + n.ip + '</span>' +
-                    droneInfo;
+                    droneInfo +
+                    dropInfo;
                 nodesEl.appendChild(row);
             });
 
@@ -1438,6 +1475,11 @@ def heartbeat():
 
     wifi_rssi = data.get("wifi_rssi")
     extra = {"wifi_rssi": wifi_rssi, "fw_version": data.get("fw_version")}
+    # WiFi drop diagnostics - only sent by firmware that tracks them, so
+    # guard rather than clobbering with None on older firmware.
+    if "disconnect_count" in data:
+        extra["disconnect_count"] = data.get("disconnect_count")
+        extra["last_disc_reason"] = data.get("last_disc_reason")
     # Live drone-proximity fields are only present once a node has actually
     # heard an ESP-NOW beacon - not every heartbeat carries them.
     if "drone_rssi" in data:
@@ -1479,6 +1521,9 @@ def api_debug():
                 "ip": state["ip"],
                 "wifi_rssi": state.get("wifi_rssi"),
                 "fw_version": state.get("fw_version"),
+                "disconnect_count": state.get("disconnect_count"),
+                "last_disc_reason": state.get("last_disc_reason"),
+                "last_disc_label": disconnect_reason_label(state.get("last_disc_reason")),
                 "drone_id": state.get("drone_id"),
                 "drone_rssi": state.get("drone_rssi"),
                 "drone_age_ms": round(live_drone_age_ms) if live_drone_age_ms is not None else None,

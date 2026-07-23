@@ -95,6 +95,14 @@ unsigned long lastDroneSampleMs = 0; // 0 = never received a sample
 // needed. Written from the WiFi event handler and the watchdog task.
 volatile unsigned long lastWiFiConnectedMs = 0;
 
+// Diagnostics reported to the Pi on each heartbeat so you can see WHY a
+// node has been dropping straight from the web debug panel, without
+// plugging into Serial. lastDisconnectReason is the ESP32 reason code from
+// the most recent drop (0 = none since boot); disconnectCount is how many
+// times this board has dropped since it powered on.
+volatile int lastDisconnectReason = 0;
+volatile uint32_t disconnectCount = 0;
+
 // Interrupt Service Routine for ESP-NOW packet reception
 void IRAM_ATTR onEspNowReceive(const esp_now_recv_info_t* info,
                                const uint8_t* data, int length) {
@@ -340,7 +348,9 @@ void heartbeatTask(void* parameter) {
 
       String payload = String("{\"node_id\":\"") + NODE_ID +
                         "\",\"fw_version\":\"" + FW_VERSION +
-                        "\",\"wifi_rssi\":" + WiFi.RSSI();
+                        "\",\"wifi_rssi\":" + WiFi.RSSI() +
+                        ",\"disconnect_count\":" + disconnectCount +
+                        ",\"last_disc_reason\":" + lastDisconnectReason;
 
       // Only include live drone-proximity fields once a sample has
       // actually been received - otherwise there's nothing meaningful to
@@ -406,6 +416,8 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       Serial.println(WiFi.localIP());
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      lastDisconnectReason = info.wifi_sta_disconnected.reason;
+      disconnectCount++;
       Serial.printf("[WiFi] Dropped (reason %d). Reconnecting...\n",
                     info.wifi_sta_disconnected.reason);
       WiFi.reconnect();
