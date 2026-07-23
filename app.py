@@ -1,25 +1,59 @@
 from flask import Flask, request, jsonify, render_template_string
 from datetime import datetime
+import hashlib
+import math
 import threading
- 
+import time
+
 app = Flask(__name__)
- 
-# In-memory event log - list of dicts: {node_id, timestamp, received_at}
+
+# In-memory event log - list of dicts: {node_id, timestamp, received_at, drone_id, rssi}
 events = []
 events_lock = threading.Lock()
- 
-LEADERBOARD_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>KWAD // Live Track</title>
-    <meta http-equiv="refresh" content="2">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta charset="UTF-8">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-    <style>
+
+# Latest known state per drone, keyed by drone_id (as string).
+# {"1": {"node_id": "checkpoint-1", "rssi": -58, "last_seen": <epoch>, "sequence": 123}}
+drone_state = {}
+drone_state_lock = threading.Lock()
+
+# Where each checkpoint node sits on the radar square, as a percentage
+# (0-100) from the top-left. Edit this to match your physical track layout.
+NODE_POSITIONS = {
+    "checkpoint-1": (18, 50),
+    "checkpoint-2": (82, 50),
+}
+
+# Any node_id not listed above gets placed automatically on a circle so it
+# still shows up on the radar instead of being dropped.
+def get_node_position(node_id):
+    if node_id in NODE_POSITIONS:
+        return NODE_POSITIONS[node_id]
+    h = int(hashlib.md5(node_id.encode()).hexdigest(), 16)
+    angle = math.radians(h % 360)
+    return (50 + 35 * math.cos(angle), 50 + 35 * math.sin(angle))
+
+# Colors cycled through for distinguishing multiple drones on the radar.
+DRONE_COLORS = ["#e0902f", "#3fb3c9", "#c94fd6", "#7fc93f", "#e04f4f", "#4f6fe0"]
+
+def get_drone_color(drone_id):
+    try:
+        idx = int(drone_id)
+    except (TypeError, ValueError):
+        idx = abs(hash(drone_id))
+    return DRONE_COLORS[idx % len(DRONE_COLORS)]
+
+# How long (seconds) a drone stays visible on the radar after its last
+# reported pass before fading out entirely.
+DRONE_TIMEOUT_S = 6.0
+
+NAV = """
+<div class="nav">
+    <a href="/" class="{active_leaderboard}">Leaderboard</a>
+    <a href="/radar" class="{active_radar}">Radar</a>
+</div>
+"""
+
+BASE_STYLE = """
         :root {
             --bg: #14171a;
             --panel: #1a1e22;
@@ -117,6 +151,30 @@ LEADERBOARD_PAGE = """
             font-size: 13px;
             color: var(--muted);
             max-width: 46ch;
+        }
+
+        .nav {
+            display: flex;
+            gap: 4px;
+            max-width: 880px;
+            margin: 0 auto 18px;
+        }
+
+        .nav a {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--muted);
+            text-decoration: none;
+            padding: 8px 16px;
+            border: 1px solid var(--hairline);
+            background: var(--panel);
+        }
+
+        .nav a.active {
+            color: var(--accent);
+            border-color: var(--accent);
         }
 
         .stats {
@@ -228,9 +286,28 @@ LEADERBOARD_PAGE = """
             font-size: 12px;
             border: 1px dashed var(--hairline);
         }
+"""
+
+LEADERBOARD_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>KWAD // Live Track</title>
+    <meta http-equiv="refresh" content="2">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+""" + BASE_STYLE + """
     </style>
 </head>
 <body>
+    <div class="nav">
+        <a href="/" class="active">Leaderboard</a>
+        <a href="/radar">Radar</a>
+    </div>
     <div class="wrap">
         <div class="panel">
             <div class="eyebrow">Checkpoint telemetry</div>
@@ -251,7 +328,7 @@ LEADERBOARD_PAGE = """
                 </div>
                 <div class="stat">
                     <div class="stat-label">Last node</div>
-                    <div class="stat-value">{{ events[0].node_id if events else '\u2014' }}</div>
+                    <div class="stat-value">{{ events[0].node_id if events else '—' }}</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label">Refresh interval</div>
@@ -264,13 +341,15 @@ LEADERBOARD_PAGE = """
             <div class="table-scroll">
                 <table>
                     <thead>
-                        <tr><th>#</th><th>Node</th><th>Sent</th><th>Received &middot; Pi</th></tr>
+                        <tr><th>#</th><th>Node</th><th>Drone</th><th>RSSI</th><th>Sent</th><th>Received &middot; Pi</th></tr>
                     </thead>
                     <tbody>
                     {% for e in events %}
                         <tr>
                             <td class="idx">{{ '%02d'|format(loop.index) }}</td>
                             <td><span class="node-pill">{{ e.node_id }}</span></td>
+                            <td>{{ e.drone_id }}</td>
+                            <td>{{ e.rssi }}</td>
                             <td>{{ e.timestamp }}</td>
                             <td>{{ e.received_at }}</td>
                         </tr>
@@ -286,36 +365,290 @@ LEADERBOARD_PAGE = """
 </body>
 </html>
 """
- 
+
+RADAR_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>KWAD // Radar</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+""" + BASE_STYLE + """
+        .radar-square {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            background:
+                linear-gradient(var(--hairline) 1px, transparent 1px) 0 0 / 10% 10%,
+                linear-gradient(90deg, var(--hairline) 1px, transparent 1px) 0 0 / 10% 10%,
+                var(--bg);
+            border: 1px solid var(--hairline);
+            overflow: hidden;
+        }
+
+        .node-marker {
+            position: absolute;
+            width: 14px;
+            height: 14px;
+            transform: translate(-50%, -50%);
+            border: 1.5px solid var(--muted);
+            background: var(--panel);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .node-label {
+            position: absolute;
+            transform: translate(-50%, 10px);
+            top: 100%;
+            font-size: 10px;
+            letter-spacing: 1px;
+            color: var(--muted);
+            white-space: nowrap;
+            text-transform: uppercase;
+        }
+
+        .drone-marker {
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            transition: left 0.4s ease, top 0.4s ease, opacity 0.4s ease;
+        }
+
+        .drone-marker .ring {
+            position: absolute;
+            inset: -14px;
+            border-radius: 50%;
+            border: 1px solid currentColor;
+            opacity: 0.5;
+            animation: radar-ping 1.6s ease-out infinite;
+        }
+
+        @keyframes radar-ping {
+            0% { transform: scale(0.4); opacity: 0.6; }
+            100% { transform: scale(2.4); opacity: 0; }
+        }
+
+        .drone-tag {
+            position: absolute;
+            left: 16px;
+            top: -6px;
+            font-size: 10px;
+            letter-spacing: 1px;
+            white-space: nowrap;
+            font-weight: 700;
+        }
+
+        .legend {
+            display: flex;
+            gap: 16px;
+            margin-top: 16px;
+            flex-wrap: wrap;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+    </style>
+</head>
+<body>
+    <div class="nav">
+        <a href="/">Leaderboard</a>
+        <a href="/radar" class="active">Radar</a>
+    </div>
+    <div class="wrap">
+        <div class="panel">
+            <div class="eyebrow">Proximity radar</div>
+            <div class="title-row">
+                <h1>KWAD // Radar</h1>
+                <span class="live"><span class="live-dot"></span>Live</span>
+            </div>
+            <p class="subhead">Drones snap to the checkpoint that most recently detected them and fade out after a few seconds of silence. This reflects discrete pass events, not continuous position.</p>
+        </div>
+
+        <div class="panel">
+            <div class="radar-square" id="radar"></div>
+            <div class="legend" id="legend"></div>
+        </div>
+    </div>
+
+    <script>
+        const radarEl = document.getElementById('radar');
+        const legendEl = document.getElementById('legend');
+
+        async function tick() {
+            let data;
+            try {
+                const res = await fetch('/api/radar');
+                data = await res.json();
+            } catch (e) {
+                return;
+            }
+
+            radarEl.querySelectorAll('.node-marker, .node-label, .drone-marker').forEach(el => el.remove());
+
+            data.nodes.forEach(n => {
+                const marker = document.createElement('div');
+                marker.className = 'node-marker';
+                marker.style.left = n.x + '%';
+                marker.style.top = n.y + '%';
+                radarEl.appendChild(marker);
+
+                const label = document.createElement('div');
+                label.className = 'node-label';
+                label.style.left = n.x + '%';
+                label.style.top = n.y + '%';
+                label.textContent = n.id;
+                radarEl.appendChild(label);
+            });
+
+            legendEl.innerHTML = '';
+            data.drones.forEach(d => {
+                const marker = document.createElement('div');
+                marker.className = 'drone-marker';
+                marker.style.left = d.x + '%';
+                marker.style.top = d.y + '%';
+                marker.style.color = d.color;
+                marker.style.background = d.color;
+                marker.style.opacity = d.opacity;
+                marker.style.boxShadow = '0 0 ' + (6 + d.strength * 10) + 'px ' + d.color;
+
+                const ring = document.createElement('div');
+                ring.className = 'ring';
+                marker.appendChild(ring);
+
+                const tag = document.createElement('div');
+                tag.className = 'drone-tag';
+                tag.style.color = d.color;
+                tag.textContent = 'DRONE ' + d.id;
+                marker.appendChild(tag);
+
+                radarEl.appendChild(marker);
+
+                const item = document.createElement('div');
+                item.className = 'legend-item';
+                item.innerHTML = '<span class="legend-dot" style="background:' + d.color + '"></span>' +
+                    'Drone ' + d.id + ' &middot; last @ ' + d.last_node + ' &middot; ' + d.rssi + ' dBm &middot; ' + d.age.toFixed(1) + 's ago';
+                legendEl.appendChild(item);
+            });
+
+            if (data.drones.length === 0) {
+                legendEl.innerHTML = '<div class="legend-item">No drones detected yet.</div>';
+            }
+        }
+
+        tick();
+        setInterval(tick, 400);
+    </script>
+</body>
+</html>
+"""
+
 @app.route("/")
 def leaderboard():
     with events_lock:
         # show most recent first
         recent = list(reversed(events))
     return render_template_string(LEADERBOARD_PAGE, events=recent, count=len(events))
- 
+
+@app.route("/radar")
+def radar():
+    return render_template_string(RADAR_PAGE)
+
+@app.route("/api/radar")
+def api_radar():
+    now = time.time()
+
+    with events_lock:
+        known_nodes = sorted({e["node_id"] for e in events} | set(NODE_POSITIONS.keys()))
+
+    nodes = []
+    for node_id in known_nodes:
+        x, y = get_node_position(node_id)
+        nodes.append({"id": node_id, "x": round(x, 1), "y": round(y, 1)})
+
+    drones = []
+    with drone_state_lock:
+        for drone_id, state in list(drone_state.items()):
+            age = now - state["last_seen"]
+            if age > DRONE_TIMEOUT_S:
+                continue
+            x, y = get_node_position(state["node_id"])
+            # Fresher sightings render more opaque; fades out toward the timeout.
+            opacity = max(0.15, 1 - (age / DRONE_TIMEOUT_S))
+            # RSSI roughly -40 (very strong) to -90 (weak) -> 1.0 to 0.1 strength.
+            strength = max(0.1, min(1.0, (state["rssi"] + 90) / 50))
+            drones.append({
+                "id": drone_id,
+                "x": round(x, 1),
+                "y": round(y, 1),
+                "color": get_drone_color(drone_id),
+                "opacity": round(opacity, 2),
+                "strength": round(strength, 2),
+                "last_node": state["node_id"],
+                "rssi": state["rssi"],
+                "age": age,
+            })
+
+    return jsonify({"nodes": nodes, "drones": drones})
+
 @app.route("/checkpoint", methods=["POST"])
 def checkpoint():
     data = request.get_json(force=True, silent=True)
     if not data or "node_id" not in data:
         return jsonify({"error": "expected JSON with at least a node_id field"}), 400
- 
+
+    node_id = data.get("node_id")
+    drone_id = str(data.get("drone_id", "1"))
+    try:
+        rssi = int(data.get("rssi"))
+    except (TypeError, ValueError):
+        rssi = None
+
     event = {
-        "node_id": data.get("node_id"),
+        "node_id": node_id,
+        "drone_id": drone_id,
+        "rssi": rssi if rssi is not None else "n/a",
         "timestamp": data.get("timestamp", "n/a"),
         "received_at": datetime.now().strftime("%H:%M:%S.%f")[:-3],
     }
- 
+
     with events_lock:
         events.append(event)
- 
+
+    if rssi is not None:
+        with drone_state_lock:
+            drone_state[drone_id] = {
+                "node_id": node_id,
+                "rssi": rssi,
+                "last_seen": time.time(),
+                "sequence": data.get("sequence"),
+            }
+
     print(f"[checkpoint] {event}")
     return jsonify({"status": "ok", "event": event}), 200
- 
+
 @app.route("/health")
 def health():
     return jsonify({"status": "alive"}), 200
- 
+
 if __name__ == "__main__":
     # 0.0.0.0 so ESP32s on the same WiFi can reach it, not just localhost
     app.run(host="0.0.0.0", port=5000, debug=True)
