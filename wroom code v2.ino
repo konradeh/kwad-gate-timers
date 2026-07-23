@@ -2,19 +2,19 @@
 #include <HTTPClient.h>
 #include <esp_now.h>
 
-// ---- EDIT THESE ----
+// ---- NETWORK CONFIGURATION ----
 const char* WIFI_SSID = "superstuudio";
 const char* WIFI_PASSWORD = "sepikoda";
-const char* PI_IP = "192.168.1.213";   // <-- your Pi's IP from `hostname -I`
+const char* PI_IP = "192.168.1.213";
 const int PI_PORT = 5000;
 const char* NODE_ID = "checkpoint-1";
-// ---------------------
 
-// Calibrate these at the actual checkpoint.
-const int8_t ENTER_RSSI = -62;
-const int8_t EXIT_RSSI = -70;
-const uint8_t REQUIRED_STRONG_SAMPLES = 3;
-const unsigned long EVENT_COOLDOWN_MS = 2000;
+// ---- GATE TIMING & TUNING PARAMETERS ----
+const int8_t ENTER_RSSI = -62;           // Threshold to begin tracking a pass
+const int8_t EXIT_RSSI = -72;            // Threshold considered outside gate
+const uint8_t REQUIRED_WEAK_SAMPLES = 5; // Weak samples required to close pass
+const unsigned long PASS_TIMEOUT_MS = 400; // Force-close pass if signal drops completely
+const unsigned long EVENT_COOLDOWN_MS = 2000; // Minimum time between valid passes per drone
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;
@@ -37,41 +37,184 @@ struct ReceivedSample {
   unsigned long received_at_ms;
 };
 
-portMUX_TYPE sampleMux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool samplePending = false;
-ReceivedSample pendingSample{};
+struct CheckpointEvent {
+  uint8_t drone_id;
+  uint32_t sequence;
+  int8_t rssi;
+  unsigned long timestamp_ms;
+};
 
-bool droneInside = false;
-uint8_t strongSampleCount = 0;
-unsigned long lastEventMs = 0;
-uint32_t lastBootId = 0;
-uint32_t lastSequence = 0;
-bool haveLastBeacon = false;
+struct DroneState {
+  bool active = false;
+  int8_t peakRssi = -128;
+  unsigned long peakTimestamp = 0;
+  uint32_t peakSequence = 0;
+  uint8_t weakSampleCount = 0;
+  unsigned long lastSampleMs = 0;
+  unsigned long lastPassEmittedMs = 0;
+  
+  uint32_t lastBootId = 0;
+  uint32_t lastSequence = 0;
+  bool haveLastBeacon = false;
+};
 
-void onEspNowReceive(const esp_now_recv_info_t* info,
-                     const uint8_t* data, int length) {
-  if (info == nullptr || data == nullptr ||
-      length != static_cast<int>(sizeof(DroneBeacon))) {
+// Queues for inter-task communication
+QueueHandle_t sampleQueue = nullptr;
+QueueHandle_t httpQueue = nullptr;
+
+// Per-drone tracking state array (supports drone IDs 0-255)
+DroneState droneTrackers[256];
+
+// Interrupt Service Routine for ESP-NOW packet reception
+void IRAM_ATTR onEspNowReceive(const esp_now_recv_info_t* info,
+                               const uint8_t* data, int length) {
+  if (info == nullptr || data == nullptr || length != sizeof(DroneBeacon)) {
     return;
   }
 
   const auto* beacon = reinterpret_cast<const DroneBeacon*>(data);
-  if (beacon->magic != BEACON_MAGIC ||
-      beacon->version != BEACON_VERSION) {
+  if (beacon->magic != BEACON_MAGIC || beacon->version != BEACON_VERSION) {
     return;
   }
 
-  const ReceivedSample sample{
+  ReceivedSample sample{
       beacon->drone_id,
       beacon->boot_id,
       beacon->sequence,
       static_cast<int8_t>(info->rx_ctrl->rssi),
-      millis()};
+      millis()
+  };
 
-  portENTER_CRITICAL(&sampleMux);
-  pendingSample = sample;
-  samplePending = true;
-  portEXIT_CRITICAL(&sampleMux);
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xQueueSendFromISR(sampleQueue, &sample, &xHigherPriorityTaskWoken);
+  if (xHigherPriorityTaskWoken) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+// Background FreeRTOS task handling network requests asynchronously
+void httpTask(void* parameter) {
+  CheckpointEvent event;
+  while (true) {
+    if (xQueueReceive(httpQueue, &event, portMAX_DELAY) == pdTRUE) {
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[HTTP Task] WiFi disconnected, dropping event.");
+        continue;
+      }
+
+      HTTPClient http;
+      String url = String("http://") + PI_IP + ":" + PI_PORT + "/checkpoint";
+
+      http.begin(url);
+      http.addHeader("Content-Type", "application/json");
+
+      String payload = String("{\"node_id\":\"") + NODE_ID +
+                        "\",\"timestamp\":" + event.timestamp_ms +
+                        ",\"drone_id\":" + event.drone_id +
+                        ",\"rssi\":" + event.rssi +
+                        ",\"sequence\":" + event.sequence + "}";
+
+      int httpCode = http.POST(payload);
+      if (httpCode > 0) {
+        Serial.printf("[HTTP Task] POST Success (%d): %s\n", httpCode, payload.c_str());
+      } else {
+        Serial.printf("[HTTP Task] POST Failed: %s\n", http.errorToString(httpCode).c_str());
+      }
+      http.end();
+    }
+  }
+}
+
+void finalizePass(uint8_t droneId, DroneState& state) {
+  const unsigned long now = millis();
+  
+  if (now - state.lastPassEmittedMs >= EVENT_COOLDOWN_MS) {
+    state.lastPassEmittedMs = now;
+
+    Serial.printf("\n>>> GATE PASSED | Drone ID: %u | Peak RSSI: %d dBm at %lu ms <<<\n\n",
+                  droneId, state.peakRssi, state.peakTimestamp);
+
+    CheckpointEvent event{
+        droneId,
+        state.peakSequence,
+        state.peakRssi,
+        state.peakTimestamp
+    };
+
+    if (xQueueSend(httpQueue, &event, 0) != pdTRUE) {
+      Serial.println("WARNING: HTTP Event Queue full! Event dropped.");
+    }
+  } else {
+    Serial.printf("Pass for Drone %u suppressed by cooldown buffer.\n", droneId);
+  }
+
+  // Reset pass tracking state
+  state.active = false;
+  state.weakSampleCount = 0;
+  state.peakRssi = -128;
+}
+
+void processSample(const ReceivedSample& sample) {
+  DroneState& state = droneTrackers[sample.drone_id];
+
+  // Sequence deduplication
+  if (state.haveLastBeacon &&
+      sample.boot_id == state.lastBootId &&
+      sample.sequence == state.lastSequence) {
+    return;
+  }
+
+  state.haveLastBeacon = true;
+  state.lastBootId = sample.boot_id;
+  state.lastSequence = sample.sequence;
+
+  const unsigned long now = sample.received_at_ms;
+
+  if (!state.active) {
+    // Check if drone enters gate sensitivity field
+    if (sample.rssi >= ENTER_RSSI) {
+      state.active = true;
+      state.peakRssi = sample.rssi;
+      state.peakTimestamp = sample.received_at_ms;
+      state.peakSequence = sample.sequence;
+      state.weakSampleCount = 0;
+      state.lastSampleMs = now;
+      Serial.printf("[Entry] Drone %u entering zone (RSSI: %d dBm)\n", sample.drone_id, sample.rssi);
+    }
+  } else {
+    // Tracking active session: check for new peak
+    if (sample.rssi > state.peakRssi) {
+      state.peakRssi = sample.rssi;
+      state.peakTimestamp = sample.received_at_ms;
+      state.peakSequence = sample.sequence;
+    }
+
+    // Accumulate exit conditions
+    if (sample.rssi <= EXIT_RSSI) {
+      state.weakSampleCount++;
+    } else {
+      state.weakSampleCount = 0; // Signal recovered, reset exit counter
+    }
+
+    state.lastSampleMs = now;
+
+    // Trigger pass event if exited
+    if (state.weakSampleCount >= REQUIRED_WEAK_SAMPLES) {
+      Serial.printf("[Exit] Drone %u left zone via signal fade.\n", sample.drone_id);
+      finalizePass(sample.drone_id, state);
+    }
+  }
+}
+
+void checkActiveTimeouts() {
+  const unsigned long now = millis();
+  for (int id = 0; id < 256; id++) {
+    DroneState& state = droneTrackers[id];
+    if (state.active && (now - state.lastSampleMs > PASS_TIMEOUT_MS)) {
+      Serial.printf("[Timeout] Drone %u left zone via timeout.\n", id);
+      finalizePass(id, state);
+    }
+  }
 }
 
 void startEspNow() {
@@ -83,13 +226,27 @@ void startEspNow() {
   }
 
   esp_now_register_recv_cb(onEspNowReceive);
-  Serial.print("ESP-NOW listening on WiFi channel ");
-  Serial.println(WiFi.channel());
+  Serial.printf("ESP-NOW listening on WiFi channel %d\n", WiFi.channel());
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  // Pre-allocate FreeRTOS Queues
+  sampleQueue = xQueueCreate(64, sizeof(ReceivedSample));
+  httpQueue = xQueueCreate(16, sizeof(CheckpointEvent));
+
+  // Spawn HTTP background worker task on Core 0
+  xTaskCreatePinnedToCore(
+      httpTask,
+      "HTTP_Task",
+      4096,
+      nullptr,
+      1,
+      nullptr,
+      0
+  );
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -103,107 +260,22 @@ void setup() {
   }
 
   Serial.println();
-  Serial.print("Connected! ESP32 IP address: ");
+  Serial.print("Connected! ESP32 Gateway IP: ");
   Serial.println(WiFi.localIP());
 
   startEspNow();
 }
 
-void sendCheckpointEvent(const ReceivedSample& sample) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, skipping send.");
-    return;
-  }
-
-  HTTPClient http;
-  String url = String("http://") + PI_IP + ":" + PI_PORT + "/checkpoint";
-
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-
-  String payload = String("{\"node_id\":\"") + NODE_ID +
-                    "\",\"timestamp\":" + sample.received_at_ms +
-                    ",\"drone_id\":" + sample.drone_id +
-                    ",\"rssi\":" + sample.rssi +
-                    ",\"sequence\":" + sample.sequence + "}";
-
-  int httpCode = http.POST(payload);
-
-  Serial.print("POST -> ");
-  Serial.print(url);
-  Serial.print(" | payload: ");
-  Serial.print(payload);
-  Serial.print(" | response code: ");
-  Serial.println(httpCode);
-
-  if (httpCode > 0) {
-    String response = http.getString();
-    Serial.print("Server response: ");
-    Serial.println(response);
-  } else {
-    Serial.print("POST failed, error: ");
-    Serial.println(http.errorToString(httpCode));
-  }
-
-  http.end();
-}
-
-void processSample(const ReceivedSample& sample) {
-  if (haveLastBeacon &&
-      sample.boot_id == lastBootId &&
-      sample.sequence == lastSequence) {
-    return;
-  }
-
-  haveLastBeacon = true;
-  lastBootId = sample.boot_id;
-  lastSequence = sample.sequence;
-
-  Serial.printf("Drone %u  seq=%lu  RSSI=%d dBm\n",
-                sample.drone_id,
-                static_cast<unsigned long>(sample.sequence),
-                static_cast<int>(sample.rssi));
-
-  if (droneInside) {
-    if (sample.rssi <= EXIT_RSSI) {
-      droneInside = false;
-      strongSampleCount = 0;
-      Serial.println("Drone left checkpoint zone; detector re-armed.");
-    }
-    return;
-  }
-
-  if (sample.rssi < ENTER_RSSI) {
-    strongSampleCount = 0;
-    return;
-  }
-
-  if (strongSampleCount < REQUIRED_STRONG_SAMPLES) {
-    strongSampleCount++;
-  }
-
-  const unsigned long now = millis();
-  const bool cooldownFinished =
-      lastEventMs == 0 || now - lastEventMs >= EVENT_COOLDOWN_MS;
-
-  if (strongSampleCount >= REQUIRED_STRONG_SAMPLES && cooldownFinished) {
-    droneInside = true;
-    strongSampleCount = 0;
-    lastEventMs = now;
-    Serial.println("CHECKPOINT PASSED");
-    sendCheckpointEvent(sample);
-  }
-}
-
 void loop() {
-  if (samplePending) {
-    portENTER_CRITICAL(&sampleMux);
-    const ReceivedSample sample = pendingSample;
-    samplePending = false;
-    portEXIT_CRITICAL(&sampleMux);
+  ReceivedSample sample;
 
+  // Process all incoming radio samples in queue
+  while (xQueueReceive(sampleQueue, &sample, 0) == pdTRUE) {
     processSample(sample);
   }
+
+  // Check if any tracked pass has timed out
+  checkActiveTimeouts();
 
   delay(2);
 }

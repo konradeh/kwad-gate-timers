@@ -2,18 +2,16 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 
-// This must match the WiFi network used by the WROOM.
-// The password is not needed: the XIAO only scans for its radio channel.
+// Must match the WiFi network used by the receiver gateway.
 const char* CHECKPOINT_WIFI_SSID = "superstuudio";
 
 const uint8_t DRONE_ID = 1;
-const unsigned long BEACON_INTERVAL_MS = 50;
-const int8_t TX_POWER_QUARTER_DBM = 32;  // 8 dBm
+const unsigned long BEACON_INTERVAL_MS = 10; // High frequency (100 Hz) for high-speed gate crossing
+const int8_t TX_POWER_QUARTER_DBM = 32;       // 8 dBm power setting
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;
-const uint8_t BROADCAST_MAC[6] = {
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 #pragma pack(push, 1)
 struct DroneBeacon {
@@ -38,8 +36,7 @@ uint8_t findCheckpointChannel() {
     const int networkCount = WiFi.scanNetworks(false, true);
     for (int index = 0; index < networkCount; index++) {
       if (WiFi.SSID(index) == CHECKPOINT_WIFI_SSID) {
-        const uint8_t channel =
-            static_cast<uint8_t>(WiFi.channel(index));
+        const uint8_t channel = static_cast<uint8_t>(WiFi.channel(index));
         WiFi.scanDelete();
         return channel;
       }
@@ -59,7 +56,7 @@ void addBroadcastPeer() {
   peer.encrypt = false;
 
   if (esp_now_add_peer(&peer) != ESP_OK) {
-    Serial.println("FATAL: could not add ESP-NOW broadcast peer");
+    Serial.println("FATAL: Could not add ESP-NOW broadcast peer");
     while (true) {
       delay(1000);
     }
@@ -88,7 +85,7 @@ void setup() {
   addBroadcastPeer();
   bootId = esp_random();
 
-  Serial.print("XIAO ready. ESP-NOW channel: ");
+  Serial.print("XIAO Beacon ready. ESP-NOW channel: ");
   Serial.println(radioChannel);
 }
 
@@ -105,15 +102,16 @@ void loop() {
       BEACON_VERSION,
       DRONE_ID,
       bootId,
-      sequenceNumber++};
+      sequenceNumber++
+  };
 
-  const esp_err_t result =
-      esp_now_send(BROADCAST_MAC,
-                   reinterpret_cast<const uint8_t*>(&beacon),
-                   sizeof(beacon));
+  const esp_err_t result = esp_now_send(
+      BROADCAST_MAC,
+      reinterpret_cast<const uint8_t*>(&beacon),
+      sizeof(beacon)
+  );
 
   if (result != ESP_OK) {
-    Serial.print("ESP-NOW send failed: ");
-    Serial.println(static_cast<int>(result));
+    Serial.printf("ESP-NOW send failed: %d\n", static_cast<int>(result));
   }
 }
