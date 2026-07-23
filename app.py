@@ -15,106 +15,271 @@ LEADERBOARD_PAGE = """
     <title>KWAD // Live Track</title>
     <meta http-equiv="refresh" content="2">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg: #14171a;
+            --panel: #1a1e22;
+            --hairline: #282e33;
+            --paper: #ece7de;
+            --muted: #7c8790;
+            --accent: #e0902f;
+            --accent-soft: rgba(224, 144, 47, 0.14);
+        }
+
         * { box-sizing: border-box; margin: 0; padding: 0; }
+
         body {
             font-family: 'JetBrains Mono', monospace;
-            background: #0a0c0a;
-            background-image:
-                linear-gradient(rgba(0,255,140,0.03) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(0,255,140,0.03) 1px, transparent 1px);
-            background-size: 24px 24px;
-            color: #d8ffe8;
-            padding: 40px 24px;
+            background: var(--bg);
+            color: var(--paper);
+            padding: 48px 20px;
             min-height: 100vh;
         }
-        .wrap { max-width: 920px; margin: 0 auto; }
- 
-        .hud {
+
+        .wrap { max-width: 880px; margin: 0 auto; }
+
+        .panel {
             position: relative;
-            border: 1px solid rgba(0,255,140,0.25);
-            background: rgba(15,25,20,0.55);
-            backdrop-filter: blur(6px);
-            padding: 24px 28px;
-            margin-bottom: 24px;
+            border: 1px solid var(--hairline);
+            background: var(--panel);
+            padding: 28px 30px;
+            margin-bottom: 22px;
         }
-        .hud::before, .hud::after,
-        .corners .c1, .corners .c2 {
-            content: ''; position: absolute; width: 14px; height: 14px;
-            border: 2px solid #00ff8c;
+
+        .panel::before, .panel::after {
+            content: '';
+            position: absolute;
+            width: 12px; height: 12px;
+            border: 1.5px solid var(--muted);
+            opacity: 0.6;
         }
-        .hud::before { top: -1px; left: -1px; border-right: none; border-bottom: none; }
-        .hud::after  { bottom: -1px; right: -1px; border-left: none; border-top: none; }
- 
-        .title { font-size: 13px; letter-spacing: 4px; color: #7dffb8; text-transform: uppercase; }
-        .title span { color: #00ff8c; }
-        h1 { font-size: 28px; font-weight: 700; margin-top: 6px; letter-spacing: 1px; }
- 
-        .stats { display: flex; gap: 20px; margin-top: 18px; flex-wrap: wrap; }
-        .stat { border: 1px solid rgba(0,255,140,0.2); padding: 10px 16px; min-width: 130px; background: rgba(0,255,140,0.03); }
-        .stat-label { font-size: 10px; letter-spacing: 2px; color: #6ba884; text-transform: uppercase; }
-        .stat-value { font-size: 22px; font-weight: 700; color: #00ff8c; margin-top: 2px; }
- 
-        .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #00ff8c; margin-right: 8px; box-shadow: 0 0 8px #00ff8c; animation: pulse 1.4s infinite; }
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
- 
-        table { width: 100%; border-collapse: collapse; }
-        thead th {
-            text-align: left; font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
-            color: #6ba884; padding: 10px 14px; border-bottom: 1px solid rgba(0,255,140,0.25);
+        .panel::before { top: -1px; left: -1px; border-right: none; border-bottom: none; }
+        .panel::after  { bottom: -1px; right: -1px; border-left: none; border-top: none; }
+
+        .eyebrow {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            color: var(--muted);
         }
-        tbody td { padding: 12px 14px; font-size: 14px; border-bottom: 1px solid rgba(0,255,140,0.08); }
-        tbody tr:hover { background: rgba(0,255,140,0.05); }
-        tbody tr:first-child td { color: #00ff8c; font-weight: 700; }
-        .idx { color: #4a7c63; width: 40px; }
+
+        .title-row {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            margin-top: 8px;
+            flex-wrap: wrap;
+        }
+
+        h1 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 30px;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+        }
+
+        .live {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            font-size: 11px;
+            letter-spacing: 2px;
+            color: var(--accent);
+            text-transform: uppercase;
+            font-weight: 500;
+        }
+
+        .live-dot {
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            background: var(--accent);
+            box-shadow: 0 0 6px rgba(224, 144, 47, 0.7);
+            animation: pulse 1.6s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .live-dot { animation: none; }
+        }
+
+        .subhead {
+            margin-top: 10px;
+            font-size: 13px;
+            color: var(--muted);
+            max-width: 46ch;
+        }
+
+        .stats {
+            display: flex;
+            gap: 14px;
+            margin-top: 24px;
+            flex-wrap: wrap;
+        }
+
+        .stat {
+            border: 1px solid var(--hairline);
+            padding: 14px 18px;
+            min-width: 140px;
+            flex: 1;
+        }
+
+        .stat-label {
+            font-size: 10px;
+            letter-spacing: 2px;
+            color: var(--muted);
+            text-transform: uppercase;
+        }
+
+        .stat-value {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--paper);
+            margin-top: 6px;
+        }
+
+        /* split-flap style digit counter for total passes */
+        .flap-row {
+            display: flex;
+            gap: 4px;
+            margin-top: 8px;
+        }
+
+        .flap-digit {
+            position: relative;
+            width: 26px;
+            height: 34px;
+            background: var(--bg);
+            border: 1px solid var(--hairline);
+            border-radius: 2px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--accent);
+            overflow: hidden;
+        }
+
+        .flap-digit::after {
+            content: '';
+            position: absolute;
+            left: 0; right: 0; top: 50%;
+            height: 1px;
+            background: var(--hairline);
+        }
+
         .node-pill {
-            display: inline-block; padding: 3px 10px; border: 1px solid rgba(0,255,140,0.3);
-            font-size: 12px; letter-spacing: 1px;
+            display: inline-block;
+            padding: 3px 10px;
+            border: 1px solid var(--hairline);
+            font-size: 12px;
+            letter-spacing: 0.5px;
+            color: var(--paper);
         }
-        .empty { padding: 40px 14px; text-align: center; color: #4a7c63; letter-spacing: 1px; }
+
+        .table-scroll { overflow-x: auto; }
+
+        table { width: 100%; border-collapse: collapse; min-width: 480px; }
+
+        thead th {
+            text-align: left;
+            font-size: 11px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--muted);
+            font-weight: 500;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--hairline);
+            white-space: nowrap;
+        }
+
+        tbody td {
+            padding: 12px;
+            font-size: 13px;
+            border-bottom: 1px solid var(--hairline);
+            white-space: nowrap;
+        }
+
+        tbody tr:hover { background: rgba(255,255,255,0.02); }
+
+        tbody tr:first-child td { border-left: 2px solid var(--accent); }
+        tbody tr:first-child td:first-child { padding-left: 10px; }
+        tbody tr td:first-child { border-left: 2px solid transparent; }
+
+        .idx { color: var(--muted); width: 32px; }
+
+        .empty {
+            padding: 44px 14px;
+            text-align: center;
+            color: var(--muted);
+            letter-spacing: 1px;
+            font-size: 12px;
+            border: 1px dashed var(--hairline);
+        }
     </style>
 </head>
 <body>
     <div class="wrap">
-        <div class="hud">
-            <div class="title">FPV RACE TRACKER // <span>{{ '{:03d}'.format(count) }}</span> EVENTS LOGGED</div>
-            <h1><span class="live-dot"></span>LIVE LEADERBOARD</h1>
+        <div class="panel">
+            <div class="eyebrow">Checkpoint telemetry</div>
+            <div class="title-row">
+                <h1>KWAD // Live Track</h1>
+                <span class="live"><span class="live-dot"></span>Live</span>
+            </div>
+            <p class="subhead">Real-time checkpoint passes reported by race nodes, relayed to base over the timing network.</p>
+
             <div class="stats">
                 <div class="stat">
                     <div class="stat-label">Total passes</div>
-                    <div class="stat-value">{{ count }}</div>
+                    <div class="flap-row">
+                        {% for digit in '%03d'|format(count) %}
+                        <span class="flap-digit">{{ digit }}</span>
+                        {% endfor %}
+                    </div>
                 </div>
                 <div class="stat">
                     <div class="stat-label">Last node</div>
-                    <div class="stat-value">{{ events[0].node_id if events else '--' }}</div>
+                    <div class="stat-value">{{ events[0].node_id if events else '\u2014' }}</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-label">Refresh</div>
+                    <div class="stat-label">Refresh interval</div>
                     <div class="stat-value">2s</div>
                 </div>
             </div>
         </div>
- 
-        <div class="hud">
-            <table>
-                <thead>
-                    <tr><th>#</th><th>Node</th><th>Sent Timestamp</th><th>Received (Pi)</th></tr>
-                </thead>
-                <tbody>
-                {% for e in events %}
-                    <tr>
-                        <td class="idx">{{ '%02d'|format(loop.index) }}</td>
-                        <td><span class="node-pill">{{ e.node_id }}</span></td>
-                        <td>{{ e.timestamp }}</td>
-                        <td>{{ e.received_at }}</td>
-                    </tr>
-                {% endfor %}
-                </tbody>
-            </table>
+
+        <div class="panel">
+            <div class="table-scroll">
+                <table>
+                    <thead>
+                        <tr><th>#</th><th>Node</th><th>Sent</th><th>Received &middot; Pi</th></tr>
+                    </thead>
+                    <tbody>
+                    {% for e in events %}
+                        <tr>
+                            <td class="idx">{{ '%02d'|format(loop.index) }}</td>
+                            <td><span class="node-pill">{{ e.node_id }}</span></td>
+                            <td>{{ e.timestamp }}</td>
+                            <td>{{ e.received_at }}</td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
             {% if not events %}
-            <div class="empty">WAITING FOR CHECKPOINT SIGNAL...</div>
+            <div class="empty">Waiting for checkpoint signal &hellip;</div>
             {% endif %}
         </div>
     </div>
