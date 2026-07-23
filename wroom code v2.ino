@@ -6,14 +6,14 @@
 // it. Reported on every heartbeat so the site's debug panel can show which
 // firmware version each physical node is actually running - no more
 // guessing which boards still need a reflash by diffing behavior.
-const char* FW_VERSION = "1.0.0";
+const char* FW_VERSION = "1.1.0";
 
 // ---- NETWORK CONFIGURATION ----
 const char* WIFI_SSID = "superstuudio";
 const char* WIFI_PASSWORD = "sepikoda";
 const char* PI_IP = "192.168.1.213";
 const int PI_PORT = 5000;
-const char* NODE_ID = "checkpoint-3";
+const char* NODE_ID = "checkpoint-1";
 
 // ---- GATE TIMING & TUNING PARAMETERS ----
 // These are DEFAULTS only. They're fetched from the Pi once at boot, then
@@ -64,14 +64,11 @@ struct CheckpointEvent {
 };
 
 struct DroneState {
-  bool active = false;
-  int8_t peakRssi = -128;
-  unsigned long peakTimestamp = 0;
-  uint32_t peakSequence = 0;
+  bool active = false;          // true while "inside" the gate zone, since the entry event fired
   uint8_t weakSampleCount = 0;
   unsigned long lastSampleMs = 0;
   unsigned long lastPassEmittedMs = 0;
-  
+
   uint32_t lastBootId = 0;
   uint32_t lastSequence = 0;
   bool haveLastBeacon = false;
@@ -154,21 +151,21 @@ void httpTask(void* parameter) {
   }
 }
 
-void finalizePass(uint8_t droneId, DroneState& state) {
+// Fires the /checkpoint event. Called the moment a drone ENTERS the gate
+// zone (crosses ENTER_RSSI), not when it leaves - lap timing wants the
+// entry timestamp, which is consistent regardless of how fast the drone
+// is moving or how long its signal takes to fade afterward.
+void triggerPassEvent(uint8_t droneId, int8_t rssi, uint32_t sequence,
+                       unsigned long timestampMs, DroneState& state) {
   const unsigned long now = millis();
-  
+
   if (now - state.lastPassEmittedMs >= EVENT_COOLDOWN_MS) {
     state.lastPassEmittedMs = now;
 
-    Serial.printf("\n>>> GATE PASSED | Drone ID: %u | Peak RSSI: %d dBm at %lu ms <<<\n\n",
-                  droneId, state.peakRssi, state.peakTimestamp);
+    Serial.printf("\n>>> GATE PASSED | Drone ID: %u | Entry RSSI: %d dBm at %lu ms <<<\n\n",
+                  droneId, rssi, timestampMs);
 
-    CheckpointEvent event{
-        droneId,
-        state.peakSequence,
-        state.peakRssi,
-        state.peakTimestamp
-    };
+    CheckpointEvent event{droneId, sequence, rssi, timestampMs};
 
     if (xQueueSend(httpQueue, &event, 0) != pdTRUE) {
       Serial.println("WARNING: HTTP Event Queue full! Event dropped.");
@@ -176,11 +173,6 @@ void finalizePass(uint8_t droneId, DroneState& state) {
   } else {
     Serial.printf("Pass for Drone %u suppressed by cooldown buffer.\n", droneId);
   }
-
-  // Reset pass tracking state
-  state.active = false;
-  state.weakSampleCount = 0;
-  state.peakRssi = -128;
 }
 
 void processSample(const ReceivedSample& sample) {
@@ -208,25 +200,18 @@ void processSample(const ReceivedSample& sample) {
   const unsigned long now = sample.received_at_ms;
 
   if (!state.active) {
-    // Check if drone enters gate sensitivity field
+    // Drone enters the gate zone: fire the pass event right away instead
+    // of waiting to see when it leaves.
     if (sample.rssi >= ENTER_RSSI) {
       state.active = true;
-      state.peakRssi = sample.rssi;
-      state.peakTimestamp = sample.received_at_ms;
-      state.peakSequence = sample.sequence;
       state.weakSampleCount = 0;
       state.lastSampleMs = now;
       Serial.printf("[Entry] Drone %u entering zone (RSSI: %d dBm)\n", sample.drone_id, sample.rssi);
+      triggerPassEvent(sample.drone_id, sample.rssi, sample.sequence, sample.received_at_ms, state);
     }
   } else {
-    // Tracking active session: check for new peak
-    if (sample.rssi > state.peakRssi) {
-      state.peakRssi = sample.rssi;
-      state.peakTimestamp = sample.received_at_ms;
-      state.peakSequence = sample.sequence;
-    }
-
-    // Accumulate exit conditions
+    // Already inside the zone: just watch for the exit conditions that
+    // re-arm this drone for its next pass. No event fires here.
     if (sample.rssi <= EXIT_RSSI) {
       state.weakSampleCount++;
     } else {
@@ -235,10 +220,10 @@ void processSample(const ReceivedSample& sample) {
 
     state.lastSampleMs = now;
 
-    // Trigger pass event if exited
     if (state.weakSampleCount >= REQUIRED_WEAK_SAMPLES) {
-      Serial.printf("[Exit] Drone %u left zone via signal fade.\n", sample.drone_id);
-      finalizePass(sample.drone_id, state);
+      Serial.printf("[Exit] Drone %u left zone via signal fade; re-armed for next pass.\n", sample.drone_id);
+      state.active = false;
+      state.weakSampleCount = 0;
     }
   }
 }
@@ -248,8 +233,9 @@ void checkActiveTimeouts() {
   for (int id = 0; id < 256; id++) {
     DroneState& state = droneTrackers[id];
     if (state.active && (now - state.lastSampleMs > PASS_TIMEOUT_MS)) {
-      Serial.printf("[Timeout] Drone %u left zone via timeout.\n", id);
-      finalizePass(id, state);
+      Serial.printf("[Timeout] Drone %u left zone via timeout; re-armed.\n", id);
+      state.active = false;
+      state.weakSampleCount = 0;
     }
   }
 }
