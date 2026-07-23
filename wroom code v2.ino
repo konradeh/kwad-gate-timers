@@ -7,15 +7,15 @@ const char* WIFI_SSID = "superstuudio";
 const char* WIFI_PASSWORD = "sepikoda";
 const char* PI_IP = "192.168.1.213";
 const int PI_PORT = 5000;
-const char* NODE_ID = "checkpoint-2";
+const char* NODE_ID = "checkpoint-3";
 
 // ---- GATE TIMING & TUNING PARAMETERS ----
-// These are DEFAULTS only. They're overwritten at boot (and re-polled
-// periodically) from the Pi's /api/settings/<NODE_ID> endpoint, so the
-// live values can be changed from the site's Settings page without
-// re-flashing. They stay non-const so fetchSettingsFromPi() can update
-// them; if the Pi is unreachable, whatever value was last applied (or
-// these defaults, on first boot) stays in effect.
+// These are DEFAULTS only. They're fetched from the Pi once at boot, then
+// kept in sync via every heartbeat response, so live values can be changed
+// from the site's Settings page without re-flashing. They stay non-const
+// so applySettingsFromJson() can update them; if the Pi is unreachable,
+// whatever value was last applied (or these defaults, on first boot)
+// stays in effect.
 int8_t ENTER_RSSI = -62;           // Threshold to begin tracking a pass
 int8_t EXIT_RSSI = -72;            // Threshold considered outside gate
 uint8_t REQUIRED_WEAK_SAMPLES = 5; // Weak samples required to close pass
@@ -28,8 +28,6 @@ unsigned long HEARTBEAT_INTERVAL_MS = 1000; // How often to tell the Pi this nod
 // each a fresh handshake, no keep-alive) a weak-signal board doesn't get
 // enough time between requests to recover from packet loss, which is what
 // was causing "read Timeout" / "connection refused" cascades.
-
-const unsigned long SETTINGS_POLL_INTERVAL_MS = 10000; // How often to re-fetch settings from the Pi
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;
@@ -234,45 +232,14 @@ void checkActiveTimeouts() {
   }
 }
 
-// Background task that pings the Pi's /api/heartbeat endpoint on a fixed
-// interval, independent of drone activity, so the debug panel can tell
-// this node is alive even when no drone has passed recently.
-void heartbeatTask(void* parameter) {
-  while (true) {
-    if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
-      String url = String("http://") + PI_IP + ":" + PI_PORT + "/api/heartbeat";
-
-      http.begin(url);
-      http.setConnectTimeout(3000);
-      http.setTimeout(3000);
-      http.addHeader("Content-Type", "application/json");
-
-      String payload = String("{\"node_id\":\"") + NODE_ID +
-                        "\",\"wifi_rssi\":" + WiFi.RSSI() + "}";
-
-      int httpCode = http.POST(payload);
-      if (httpCode > 0) {
-        Serial.printf("[Heartbeat] OK (%d)\n", httpCode);
-      } else {
-        Serial.printf("[Heartbeat] Failed: %s\n", http.errorToString(httpCode).c_str());
-      }
-      http.end();
-    } else {
-      Serial.println("[Heartbeat] WiFi disconnected, skipping.");
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));
-  }
-}
-
 // Sentinel returned by extractJsonNumber() when a key isn't present in the
 // response, chosen to be outside any real value this firmware ever uses.
 const long JSON_KEY_NOT_FOUND = -2147483647L;
 
 // Minimal hand-rolled parser for the small flat JSON object the Pi returns
-// from /api/settings/<node_id>, e.g. {"enter_rssi":-62,"exit_rssi":-72,...}.
-// Avoids pulling in ArduinoJson for a fixed, known schema.
+// from /api/settings/<node_id> and /api/heartbeat, e.g.
+// {"status":"ok","enter_rssi":-62,"exit_rssi":-72,...}. Avoids pulling in
+// ArduinoJson for a fixed, known schema.
 long extractJsonNumber(const String& json, const char* key) {
   String pattern = String("\"") + key + "\":";
   int idx = json.indexOf(pattern);
@@ -289,11 +256,36 @@ long extractJsonNumber(const String& json, const char* key) {
   return json.substring(start, idx).toInt();
 }
 
-// Fetches this node's gate-timing settings from the Pi and applies any
-// values present in the response. Silently keeps the current values (last
-// applied, or the compiled-in defaults on first boot) if the Pi can't be
-// reached or a field is missing - a node should never brick itself just
-// because the Pi is briefly unreachable.
+// Applies any settings fields present in a JSON response body to the live
+// globals. Missing fields are left untouched, so a partial/stale response
+// never blanks out a value that just wasn't included.
+void applySettingsFromJson(const String& body) {
+  long v;
+
+  v = extractJsonNumber(body, "enter_rssi");
+  if (v != JSON_KEY_NOT_FOUND) ENTER_RSSI = (int8_t)v;
+
+  v = extractJsonNumber(body, "exit_rssi");
+  if (v != JSON_KEY_NOT_FOUND) EXIT_RSSI = (int8_t)v;
+
+  v = extractJsonNumber(body, "required_weak_samples");
+  if (v != JSON_KEY_NOT_FOUND) REQUIRED_WEAK_SAMPLES = (uint8_t)v;
+
+  v = extractJsonNumber(body, "pass_timeout_ms");
+  if (v != JSON_KEY_NOT_FOUND) PASS_TIMEOUT_MS = (unsigned long)v;
+
+  v = extractJsonNumber(body, "event_cooldown_ms");
+  if (v != JSON_KEY_NOT_FOUND) EVENT_COOLDOWN_MS = (unsigned long)v;
+
+  v = extractJsonNumber(body, "heartbeat_interval_ms");
+  if (v != JSON_KEY_NOT_FOUND) HEARTBEAT_INTERVAL_MS = (unsigned long)v;
+}
+
+// One-time settings fetch used only at boot, before the first pass can be
+// detected. Ongoing updates arrive piggybacked on the heartbeat response
+// instead (see heartbeatTask) rather than from a second periodic request -
+// two concurrent HTTP tasks contending for one ESP32's single WiFi radio
+// was causing periodic multi-second stalls on weak-signal boards.
 void fetchSettingsFromPi() {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -305,27 +297,7 @@ void fetchSettingsFromPi() {
 
   int httpCode = http.GET();
   if (httpCode == 200) {
-    String body = http.getString();
-    long v;
-
-    v = extractJsonNumber(body, "enter_rssi");
-    if (v != JSON_KEY_NOT_FOUND) ENTER_RSSI = (int8_t)v;
-
-    v = extractJsonNumber(body, "exit_rssi");
-    if (v != JSON_KEY_NOT_FOUND) EXIT_RSSI = (int8_t)v;
-
-    v = extractJsonNumber(body, "required_weak_samples");
-    if (v != JSON_KEY_NOT_FOUND) REQUIRED_WEAK_SAMPLES = (uint8_t)v;
-
-    v = extractJsonNumber(body, "pass_timeout_ms");
-    if (v != JSON_KEY_NOT_FOUND) PASS_TIMEOUT_MS = (unsigned long)v;
-
-    v = extractJsonNumber(body, "event_cooldown_ms");
-    if (v != JSON_KEY_NOT_FOUND) EVENT_COOLDOWN_MS = (unsigned long)v;
-
-    v = extractJsonNumber(body, "heartbeat_interval_ms");
-    if (v != JSON_KEY_NOT_FOUND) HEARTBEAT_INTERVAL_MS = (unsigned long)v;
-
+    applySettingsFromJson(http.getString());
     Serial.printf("[Settings] Applied: ENTER=%d EXIT=%d WEAK=%u PASS_TO=%lu COOLDOWN=%lu HB=%lu\n",
                   ENTER_RSSI, EXIT_RSSI, REQUIRED_WEAK_SAMPLES,
                   PASS_TIMEOUT_MS, EVENT_COOLDOWN_MS, HEARTBEAT_INTERVAL_MS);
@@ -335,12 +307,39 @@ void fetchSettingsFromPi() {
   http.end();
 }
 
-// Background task that re-polls settings periodically so changes made on
-// the site's Settings page take effect live, without re-flashing.
-void settingsTask(void* parameter) {
+// Background task that pings the Pi's /api/heartbeat endpoint on a fixed
+// interval, independent of drone activity, so the debug panel can tell
+// this node is alive even when no drone has passed recently. The Pi's
+// response also carries this node's current settings, so this single
+// request keeps both the "alive" signal and live config in sync - no
+// separate settings-polling task needed.
+void heartbeatTask(void* parameter) {
   while (true) {
-    fetchSettingsFromPi();
-    vTaskDelay(pdMS_TO_TICKS(SETTINGS_POLL_INTERVAL_MS));
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String url = String("http://") + PI_IP + ":" + PI_PORT + "/api/heartbeat";
+
+      http.begin(url);
+      http.setConnectTimeout(3000);
+      http.setTimeout(3000);
+      http.addHeader("Content-Type", "application/json");
+
+      String payload = String("{\"node_id\":\"") + NODE_ID +
+                        "\",\"wifi_rssi\":" + WiFi.RSSI() + "}";
+
+      int httpCode = http.POST(payload);
+      if (httpCode > 0) {
+        applySettingsFromJson(http.getString());
+        Serial.printf("[Heartbeat] OK (%d)\n", httpCode);
+      } else {
+        Serial.printf("[Heartbeat] Failed: %s\n", http.errorToString(httpCode).c_str());
+      }
+      http.end();
+    } else {
+      Serial.println("[Heartbeat] WiFi disconnected, skipping.");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));
   }
 }
 
@@ -412,17 +411,6 @@ void setup() {
   xTaskCreatePinnedToCore(
       heartbeatTask,
       "Heartbeat_Task",
-      4096,
-      nullptr,
-      1,
-      nullptr,
-      0
-  );
-
-  // Spawn periodic settings-refresh task on Core 0
-  xTaskCreatePinnedToCore(
-      settingsTask,
-      "Settings_Task",
       4096,
       nullptr,
       1,

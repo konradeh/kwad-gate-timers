@@ -1334,7 +1334,12 @@ def heartbeat():
     wifi_rssi = data.get("wifi_rssi")
     record_contact(node_id, "heartbeat", wifi_rssi=wifi_rssi)
 
-    return jsonify({"status": "ok"}), 200
+    # Piggyback the node's current effective settings on the heartbeat
+    # response instead of making firmware run a second, separate polling
+    # task for /api/settings. Two concurrent HTTP tasks contending for one
+    # ESP32's single WiFi radio was causing periodic multi-second stalls -
+    # one request per heartbeat cycle does both jobs.
+    return jsonify({"status": "ok", **get_effective_settings(node_id)}), 200
 
 @app.route("/api/debug")
 def api_debug():
