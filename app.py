@@ -968,5 +968,9 @@ def health():
     return jsonify({"status": "alive"}), 200
 
 if __name__ == "__main__":
-    # 0.0.0.0 so ESP32s on the same WiFi can reach it, not just localhost
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # 0.0.0.0 so ESP32s on the same WiFi can reach it, not just localhost.
+    # threaded=True is required once more than one node is talking to the
+    # Pi: Flask's dev server handles one request at a time by default, so
+    # concurrent heartbeats/checkpoints from multiple ESP32s start seeing
+    # "connection refused" / "read Timeout" as they queue up and time out.
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
