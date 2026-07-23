@@ -10,18 +10,26 @@ const int PI_PORT = 5000;
 const char* NODE_ID = "checkpoint-2";
 
 // ---- GATE TIMING & TUNING PARAMETERS ----
-const int8_t ENTER_RSSI = -62;           // Threshold to begin tracking a pass
-const int8_t EXIT_RSSI = -72;            // Threshold considered outside gate
-const uint8_t REQUIRED_WEAK_SAMPLES = 15; // Weak samples required to close pass
-const unsigned long PASS_TIMEOUT_MS = 400; // Force-close pass if signal drops completely
-const unsigned long EVENT_COOLDOWN_MS = 2000; // Minimum time between valid passes per drone
-const unsigned long HEARTBEAT_INTERVAL_MS = 1000; // How often to tell the Pi this node is alive.
+// These are DEFAULTS only. They're overwritten at boot (and re-polled
+// periodically) from the Pi's /api/settings/<NODE_ID> endpoint, so the
+// live values can be changed from the site's Settings page without
+// re-flashing. They stay non-const so fetchSettingsFromPi() can update
+// them; if the Pi is unreachable, whatever value was last applied (or
+// these defaults, on first boot) stays in effect.
+int8_t ENTER_RSSI = -62;           // Threshold to begin tracking a pass
+int8_t EXIT_RSSI = -72;            // Threshold considered outside gate
+uint8_t REQUIRED_WEAK_SAMPLES = 5; // Weak samples required to close pass
+unsigned long PASS_TIMEOUT_MS = 400; // Force-close pass if signal drops completely
+unsigned long EVENT_COOLDOWN_MS = 2000; // Minimum time between valid passes per drone
+unsigned long HEARTBEAT_INTERVAL_MS = 1000; // How often to tell the Pi this node is alive.
 // Keep this >= ~1000ms. The debug panel already polls the Pi every 150ms
 // on its own, so a faster heartbeat doesn't make the UI feel more live -
 // it just multiplies TCP connection churn per node. At 100ms (10 req/s,
 // each a fresh handshake, no keep-alive) a weak-signal board doesn't get
 // enough time between requests to recover from packet loss, which is what
 // was causing "read Timeout" / "connection refused" cascades.
+
+const unsigned long SETTINGS_POLL_INTERVAL_MS = 10000; // How often to re-fetch settings from the Pi
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;
@@ -258,6 +266,84 @@ void heartbeatTask(void* parameter) {
   }
 }
 
+// Sentinel returned by extractJsonNumber() when a key isn't present in the
+// response, chosen to be outside any real value this firmware ever uses.
+const long JSON_KEY_NOT_FOUND = -2147483647L;
+
+// Minimal hand-rolled parser for the small flat JSON object the Pi returns
+// from /api/settings/<node_id>, e.g. {"enter_rssi":-62,"exit_rssi":-72,...}.
+// Avoids pulling in ArduinoJson for a fixed, known schema.
+long extractJsonNumber(const String& json, const char* key) {
+  String pattern = String("\"") + key + "\":";
+  int idx = json.indexOf(pattern);
+  if (idx < 0) return JSON_KEY_NOT_FOUND;
+
+  idx += pattern.length();
+  while (idx < (int)json.length() && json[idx] == ' ') idx++;
+
+  int start = idx;
+  if (idx < (int)json.length() && json[idx] == '-') idx++;
+  while (idx < (int)json.length() && isDigit(json[idx])) idx++;
+
+  if (idx == start || (idx == start + 1 && json[start] == '-')) return JSON_KEY_NOT_FOUND;
+  return json.substring(start, idx).toInt();
+}
+
+// Fetches this node's gate-timing settings from the Pi and applies any
+// values present in the response. Silently keeps the current values (last
+// applied, or the compiled-in defaults on first boot) if the Pi can't be
+// reached or a field is missing - a node should never brick itself just
+// because the Pi is briefly unreachable.
+void fetchSettingsFromPi() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String("http://") + PI_IP + ":" + PI_PORT + "/api/settings/" + NODE_ID;
+  http.begin(url);
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String body = http.getString();
+    long v;
+
+    v = extractJsonNumber(body, "enter_rssi");
+    if (v != JSON_KEY_NOT_FOUND) ENTER_RSSI = (int8_t)v;
+
+    v = extractJsonNumber(body, "exit_rssi");
+    if (v != JSON_KEY_NOT_FOUND) EXIT_RSSI = (int8_t)v;
+
+    v = extractJsonNumber(body, "required_weak_samples");
+    if (v != JSON_KEY_NOT_FOUND) REQUIRED_WEAK_SAMPLES = (uint8_t)v;
+
+    v = extractJsonNumber(body, "pass_timeout_ms");
+    if (v != JSON_KEY_NOT_FOUND) PASS_TIMEOUT_MS = (unsigned long)v;
+
+    v = extractJsonNumber(body, "event_cooldown_ms");
+    if (v != JSON_KEY_NOT_FOUND) EVENT_COOLDOWN_MS = (unsigned long)v;
+
+    v = extractJsonNumber(body, "heartbeat_interval_ms");
+    if (v != JSON_KEY_NOT_FOUND) HEARTBEAT_INTERVAL_MS = (unsigned long)v;
+
+    Serial.printf("[Settings] Applied: ENTER=%d EXIT=%d WEAK=%u PASS_TO=%lu COOLDOWN=%lu HB=%lu\n",
+                  ENTER_RSSI, EXIT_RSSI, REQUIRED_WEAK_SAMPLES,
+                  PASS_TIMEOUT_MS, EVENT_COOLDOWN_MS, HEARTBEAT_INTERVAL_MS);
+  } else {
+    Serial.printf("[Settings] Fetch failed (%d), keeping current values.\n", httpCode);
+  }
+  http.end();
+}
+
+// Background task that re-polls settings periodically so changes made on
+// the site's Settings page take effect live, without re-flashing.
+void settingsTask(void* parameter) {
+  while (true) {
+    fetchSettingsFromPi();
+    vTaskDelay(pdMS_TO_TICKS(SETTINGS_POLL_INTERVAL_MS));
+  }
+}
+
 void startEspNow() {
   if (esp_now_init() != ESP_OK) {
     Serial.println("FATAL: ESP-NOW initialization failed");
@@ -333,7 +419,19 @@ void setup() {
       0
   );
 
+  // Spawn periodic settings-refresh task on Core 0
+  xTaskCreatePinnedToCore(
+      settingsTask,
+      "Settings_Task",
+      4096,
+      nullptr,
+      1,
+      nullptr,
+      0
+  );
+
   connectWiFi();
+  fetchSettingsFromPi(); // apply live settings once before the first pass can be detected
   startEspNow();
 }
 

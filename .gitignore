@@ -2,3 +2,4 @@ venv/
 __pycache__/
 *.pyc
 server.log
+node_settings.json

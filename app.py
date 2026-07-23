@@ -1,12 +1,16 @@
 from flask import Flask, request, jsonify, render_template_string
 from collections import defaultdict, deque
 from datetime import datetime
+from pathlib import Path
 import hashlib
+import json
 import math
 import threading
 import time
 
 app = Flask(__name__)
+
+APP_VERSION = "1.1.0"
 
 # In-memory event log - list of dicts: {node_id, timestamp, received_at, drone_id, rssi}
 events = []
@@ -52,6 +56,52 @@ def record_contact(node_id, kind, **extra):
 drone_state = {}
 drone_state_lock = threading.Lock()
 
+# ---- Per-checkpoint gate-timing settings ----
+# These mirror the tunable constants in wroom_code_v2.ino. Firmware fetches
+# its own settings from GET /api/settings/<node_id> on boot and re-polls
+# periodically, so changes made here take effect without re-flashing.
+DEFAULT_SETTINGS = {
+    "enter_rssi": -62,
+    "exit_rssi": -72,
+    "required_weak_samples": 5,
+    "pass_timeout_ms": 400,
+    "event_cooldown_ms": 2000,
+    "heartbeat_interval_ms": 1000,
+}
+
+# Bounds used to sanity-check values coming from the settings form before
+# they're handed to a physical board.
+SETTINGS_BOUNDS = {
+    "enter_rssi": (-100, 0),
+    "exit_rssi": (-100, 0),
+    "required_weak_samples": (1, 255),
+    "pass_timeout_ms": (50, 60000),
+    "event_cooldown_ms": (0, 60000),
+    "heartbeat_interval_ms": (200, 60000),
+}
+
+SETTINGS_FILE = Path(__file__).parent / "node_settings.json"
+settings_lock = threading.Lock()
+
+def load_node_settings():
+    try:
+        return json.loads(SETTINGS_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+def save_node_settings(data):
+    SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+
+# Per-node overrides on top of DEFAULT_SETTINGS, persisted to disk so a Pi
+# reboot doesn't silently reset every checkpoint back to defaults.
+node_settings = load_node_settings()
+
+def get_effective_settings(node_id):
+    effective = dict(DEFAULT_SETTINGS)
+    with settings_lock:
+        effective.update(node_settings.get(node_id, {}))
+    return effective
+
 # Where each checkpoint node sits on the radar square, as a percentage
 # (0-100) from the top-left. Edit this to match your physical track layout.
 NODE_POSITIONS = {
@@ -72,7 +122,9 @@ def get_node_position(node_id):
     return (50 + 35 * math.cos(angle), 50 + 35 * math.sin(angle))
 
 # Colors cycled through for distinguishing multiple drones on the radar.
-DRONE_COLORS = ["#e0902f", "#3fb3c9", "#c94fd6", "#7fc93f", "#e04f4f", "#4f6fe0"]
+# Green is reserved for brand chrome, so drones stay visually distinct from
+# the site's own accent color.
+DRONE_COLORS = ["#ffb545", "#3fb3c9", "#c94fd6", "#ff6f59", "#8f7cff", "#f2d94e"]
 
 def get_drone_color(drone_id):
     try:
@@ -85,22 +137,42 @@ def get_drone_color(drone_id):
 # reported pass before fading out entirely.
 DRONE_TIMEOUT_S = 6.0
 
-NAV = """
-<div class="nav">
-    <a href="/" class="{active_leaderboard}">Leaderboard</a>
-    <a href="/radar" class="{active_radar}">Radar</a>
-</div>
-"""
+# Hand-traced from the kwad brand sheet: rounded-square gate + diagonal
+# flight path + dot. Uses currentColor so CSS controls the color per page.
+KWAD_LOGO_SVG = """<svg class="brand-mark" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" fill="none">
+<rect x="26" y="26" width="46" height="46" rx="12" stroke="currentColor" stroke-width="9"/>
+<path d="M18 84C22 80 26 78 30 72L76 26" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="81" cy="21" r="7" fill="currentColor"/>
+</svg>"""
+
+def topbar(active):
+    links = [("/", "Leaderboard"), ("/radar", "Radar"), ("/settings", "Settings")]
+    nav_html = "\n".join(
+        f'<a href="{href}" class="{"active" if label == active else ""}">{label}</a>'
+        for href, label in links
+    )
+    return f"""
+    <div class="topbar">
+        <a href="/" class="brand">
+            {KWAD_LOGO_SVG}
+            <span class="brand-name">kwad</span>
+            <span class="brand-version">v{APP_VERSION}</span>
+        </a>
+        <div class="nav">
+            {nav_html}
+        </div>
+    </div>
+    """
 
 BASE_STYLE = """
         :root {
-            --bg: #14171a;
-            --panel: #1a1e22;
-            --hairline: #282e33;
+            --bg: #0e1210;
+            --panel: #151b17;
+            --hairline: #26302a;
             --paper: #ece7de;
             --muted: #7c8790;
-            --accent: #e0902f;
-            --accent-soft: rgba(224, 144, 47, 0.14);
+            --accent: #2ee06f;
+            --accent-soft: rgba(46, 224, 111, 0.14);
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -172,7 +244,7 @@ BASE_STYLE = """
             width: 7px; height: 7px;
             border-radius: 50%;
             background: var(--accent);
-            box-shadow: 0 0 6px rgba(224, 144, 47, 0.7);
+            box-shadow: 0 0 6px rgba(46, 224, 111, 0.7);
             animation: pulse 1.6s ease-in-out infinite;
         }
 
@@ -192,11 +264,52 @@ BASE_STYLE = """
             max-width: 46ch;
         }
 
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            max-width: 880px;
+            margin: 0 auto 18px;
+            flex-wrap: wrap;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            text-decoration: none;
+            color: var(--paper);
+        }
+
+        .brand-mark {
+            width: 24px;
+            height: 24px;
+            color: var(--accent);
+            flex-shrink: 0;
+        }
+
+        .brand-name {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 17px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            color: var(--paper);
+        }
+
+        .brand-version {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            letter-spacing: 1px;
+            color: var(--muted);
+            border: 1px solid var(--hairline);
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+
         .nav {
             display: flex;
             gap: 4px;
-            max-width: 880px;
-            margin: 0 auto 18px;
         }
 
         .nav a {
@@ -587,7 +700,7 @@ LEADERBOARD_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>KWAD // Live Track</title>
+    <title>kwad — Live Track</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta charset="UTF-8">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -598,15 +711,12 @@ LEADERBOARD_PAGE = """
     </style>
 </head>
 <body>
-    <div class="nav">
-        <a href="/" class="active">Leaderboard</a>
-        <a href="/radar">Radar</a>
-    </div>
+    {{ topbar_html|safe }}
     <div class="wrap">
         <div class="panel">
             <div class="eyebrow">Checkpoint telemetry</div>
             <div class="title-row">
-                <h1>KWAD // Live Track</h1>
+                <h1>Live Track</h1>
                 <span class="live"><span class="live-dot"></span>Live</span>
             </div>
             <p class="subhead">Real-time checkpoint passes reported by race nodes, relayed to base over the timing network.</p>
@@ -690,7 +800,7 @@ RADAR_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>KWAD // Radar</title>
+    <title>kwad — Radar</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta charset="UTF-8">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -789,15 +899,12 @@ RADAR_PAGE = """
     </style>
 </head>
 <body>
-    <div class="nav">
-        <a href="/">Leaderboard</a>
-        <a href="/radar" class="active">Radar</a>
-    </div>
+    {{ topbar_html|safe }}
     <div class="wrap">
         <div class="panel">
             <div class="eyebrow">Proximity radar</div>
             <div class="title-row">
-                <h1>KWAD // Radar</h1>
+                <h1>Radar</h1>
                 <span class="live"><span class="live-dot"></span>Live</span>
             </div>
             <p class="subhead">Drones snap to the checkpoint that most recently detected them and fade out after a few seconds of silence. This reflects discrete pass events, not continuous position.</p>
@@ -882,9 +989,254 @@ RADAR_PAGE = """
 </html>
 """
 
+SETTINGS_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>kwad — Settings</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+""" + BASE_STYLE + """
+        .settings-select-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .settings-select-row select {
+            flex: 1;
+            min-width: 200px;
+            background: var(--bg);
+            color: var(--paper);
+            border: 1px solid var(--hairline);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            padding: 10px 12px;
+        }
+
+        .settings-select-row select:focus { outline: none; border-color: var(--accent); }
+
+        .btn {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 10px 16px;
+            border: 1px solid var(--hairline);
+            background: var(--panel);
+            color: var(--paper);
+            cursor: pointer;
+        }
+
+        .btn:hover { border-color: var(--accent); color: var(--accent); }
+
+        .btn-primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #08130c;
+            font-weight: 700;
+        }
+
+        .btn-primary:hover { color: #08130c; opacity: 0.9; }
+
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .field-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 18px;
+            margin-top: 22px;
+        }
+
+        .field label {
+            display: block;
+            font-size: 11px;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            color: var(--paper);
+            margin-bottom: 6px;
+        }
+
+        .field input {
+            width: 100%;
+            background: var(--bg);
+            color: var(--paper);
+            border: 1px solid var(--hairline);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            padding: 9px 10px;
+        }
+
+        .field input:focus { outline: none; border-color: var(--accent); }
+
+        .field-hint {
+            margin-top: 5px;
+            font-size: 11px;
+            color: var(--muted);
+            line-height: 1.4;
+        }
+
+        .settings-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 24px;
+            align-items: center;
+        }
+
+        .settings-status {
+            font-size: 12px;
+            letter-spacing: 0.5px;
+        }
+
+        .settings-status.ok { color: var(--accent); }
+        .settings-status.err { color: #ff6f59; }
+
+        .override-badge {
+            font-size: 10px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            color: var(--accent);
+            border: 1px solid var(--accent);
+            padding: 2px 7px;
+        }
+    </style>
+</head>
+<body>
+    {{ topbar_html|safe }}
+    <div class="wrap">
+        <div class="panel">
+            <div class="eyebrow">Checkpoint configuration</div>
+            <div class="title-row">
+                <h1>Settings</h1>
+            </div>
+            <p class="subhead">Gate-timing and heartbeat parameters per checkpoint. Boards fetch these from the Pi on boot and re-poll periodically, so changes here apply live without re-flashing &mdash; as long as the board is already running firmware that fetches settings.</p>
+
+            <div class="settings-select-row" style="margin-top: 22px;">
+                <select id="nodeSelect"></select>
+                <span id="overrideBadge" class="override-badge" style="display:none;">Customized</span>
+                <button class="btn" id="resetBtn" type="button">Reset to defaults</button>
+            </div>
+        </div>
+
+        <div class="panel">
+            <form id="settingsForm">
+                <div class="field-grid" id="fieldGrid"></div>
+                <div class="settings-actions">
+                    <button class="btn btn-primary" type="submit">Save</button>
+                    <span class="settings-status" id="statusMsg"></span>
+                </div>
+            </form>
+        </div>
+    </div>
+""" + DEBUG_PANEL_HTML + """
+    <script>
+        const FIELD_META = [
+            { key: 'enter_rssi', label: 'Enter RSSI (dBm)', hint: 'Threshold to begin tracking a pass. Closer to 0 = drone must be closer.' },
+            { key: 'exit_rssi', label: 'Exit RSSI (dBm)', hint: 'Threshold considered outside the gate zone.' },
+            { key: 'required_weak_samples', label: 'Required weak samples', hint: 'Consecutive weak readings needed to close out a pass.' },
+            { key: 'pass_timeout_ms', label: 'Pass timeout (ms)', hint: 'Force-close a pass if the signal drops out completely.' },
+            { key: 'event_cooldown_ms', label: 'Event cooldown (ms)', hint: 'Minimum time between valid passes for the same drone.' },
+            { key: 'heartbeat_interval_ms', label: 'Heartbeat interval (ms)', hint: 'How often this node pings the Pi to prove it is alive. Keep this at 1000ms or higher — faster intervals multiply TCP connection churn and can cause "connection refused" errors on weak-signal boards without making the debug panel feel any more live (it already polls independently).' },
+        ];
+
+        const nodeSelect = document.getElementById('nodeSelect');
+        const fieldGrid = document.getElementById('fieldGrid');
+        const overrideBadge = document.getElementById('overrideBadge');
+        const statusMsg = document.getElementById('statusMsg');
+        const resetBtn = document.getElementById('resetBtn');
+
+        let currentData = null;
+
+        function renderFields(values) {
+            fieldGrid.innerHTML = FIELD_META.map(f => `
+                <div class="field">
+                    <label for="f_${f.key}">${f.label}</label>
+                    <input type="number" id="f_${f.key}" name="${f.key}" value="${values[f.key]}">
+                    <div class="field-hint">${f.hint}</div>
+                </div>
+            `).join('');
+        }
+
+        // clearStatus=false is used when reloading right after a save/reset,
+        // so the just-set confirmation message survives the refresh instead
+        // of being wiped out immediately.
+        async function loadAll(clearStatus = true) {
+            const res = await fetch('/api/settings');
+            currentData = await res.json();
+
+            const selected = nodeSelect.value;
+            const nodeIds = Object.keys(currentData.nodes).sort();
+            nodeSelect.innerHTML = nodeIds.map(id => `<option value="${id}">${id}</option>`).join('');
+            if (nodeIds.includes(selected)) nodeSelect.value = selected;
+
+            refreshFields(clearStatus);
+        }
+
+        function refreshFields(clearStatus) {
+            const nodeId = nodeSelect.value;
+            if (!nodeId || !currentData) return;
+            renderFields(currentData.nodes[nodeId]);
+            overrideBadge.style.display = currentData.overridden.includes(nodeId) ? 'inline-block' : 'none';
+            if (clearStatus) statusMsg.textContent = '';
+        }
+
+        nodeSelect.addEventListener('change', () => refreshFields(true));
+
+        document.getElementById('settingsForm').addEventListener('submit', async (ev) => {
+            ev.preventDefault();
+            const nodeId = nodeSelect.value;
+            if (!nodeId) return;
+
+            const payload = {};
+            FIELD_META.forEach(f => {
+                payload[f.key] = document.getElementById('f_' + f.key).value;
+            });
+
+            statusMsg.textContent = 'Saving...';
+            statusMsg.className = 'settings-status';
+
+            try {
+                const res = await fetch('/api/settings/' + encodeURIComponent(nodeId), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const body = await res.json();
+                if (!res.ok) throw new Error(body.error || 'Save failed');
+
+                statusMsg.textContent = 'Saved — ' + nodeId + ' will pick this up on its next settings poll.';
+                statusMsg.className = 'settings-status ok';
+                await loadAll(false);
+            } catch (e) {
+                statusMsg.textContent = e.message;
+                statusMsg.className = 'settings-status err';
+            }
+        });
+
+        resetBtn.addEventListener('click', async () => {
+            const nodeId = nodeSelect.value;
+            if (!nodeId) return;
+
+            await fetch('/api/settings/' + encodeURIComponent(nodeId), { method: 'DELETE' });
+            statusMsg.textContent = 'Reset to defaults.';
+            statusMsg.className = 'settings-status ok';
+            await loadAll(false);
+        });
+
+        loadAll();
+    </script>
+</body>
+</html>
+"""
+
 @app.route("/")
 def leaderboard():
-    return render_template_string(LEADERBOARD_PAGE)
+    return render_template_string(LEADERBOARD_PAGE, topbar_html=topbar("Leaderboard"))
 
 @app.route("/api/leaderboard")
 def api_leaderboard():
@@ -895,7 +1247,7 @@ def api_leaderboard():
 
 @app.route("/radar")
 def radar():
-    return render_template_string(RADAR_PAGE)
+    return render_template_string(RADAR_PAGE, topbar_html=topbar("Radar"))
 
 @app.route("/api/radar")
 def api_radar():
@@ -1011,6 +1363,59 @@ def api_debug():
     log = merged[:200]
 
     return jsonify({"nodes": nodes, "log": log})
+
+@app.route("/settings")
+def settings_page():
+    return render_template_string(SETTINGS_PAGE, topbar_html=topbar("Settings"))
+
+@app.route("/api/settings")
+def api_settings_all():
+    with node_registry_lock:
+        known_ids = sorted(node_registry.keys())
+    with settings_lock:
+        overridden_ids = sorted(node_settings.keys())
+    all_ids = sorted(set(known_ids) | set(overridden_ids) | set(NODE_POSITIONS.keys()))
+
+    return jsonify({
+        "defaults": DEFAULT_SETTINGS,
+        "bounds": SETTINGS_BOUNDS,
+        "nodes": {node_id: get_effective_settings(node_id) for node_id in all_ids},
+        "overridden": overridden_ids,
+    })
+
+@app.route("/api/settings/<node_id>", methods=["GET"])
+def api_settings_get(node_id):
+    return jsonify(get_effective_settings(node_id))
+
+@app.route("/api/settings/<node_id>", methods=["POST"])
+def api_settings_set(node_id):
+    data = request.get_json(force=True, silent=True) or {}
+
+    cleaned = {}
+    for key, (lo, hi) in SETTINGS_BOUNDS.items():
+        if key not in data:
+            continue
+        try:
+            value = int(data[key])
+        except (TypeError, ValueError):
+            return jsonify({"error": f"{key} must be an integer"}), 400
+        if not (lo <= value <= hi):
+            return jsonify({"error": f"{key} must be between {lo} and {hi}"}), 400
+        cleaned[key] = value
+
+    with settings_lock:
+        node_settings.setdefault(node_id, {}).update(cleaned)
+        save_node_settings(node_settings)
+
+    return jsonify(get_effective_settings(node_id))
+
+@app.route("/api/settings/<node_id>", methods=["DELETE"])
+def api_settings_reset(node_id):
+    with settings_lock:
+        node_settings.pop(node_id, None)
+        save_node_settings(node_settings)
+
+    return jsonify(get_effective_settings(node_id))
 
 @app.route("/health")
 def health():
