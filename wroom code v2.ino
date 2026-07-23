@@ -1,19 +1,20 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 
 // Bump this whenever this file changes and reflash every board that needs
 // it. Reported on every heartbeat so the site's debug panel can show which
 // firmware version each physical node is actually running - no more
 // guessing which boards still need a reflash by diffing behavior.
-const char* FW_VERSION = "1.1.0";
+const char* FW_VERSION = "1.2.0";
 
 // ---- NETWORK CONFIGURATION ----
 const char* WIFI_SSID = "superstuudio";
 const char* WIFI_PASSWORD = "sepikoda";
 const char* PI_IP = "192.168.1.213";
 const int PI_PORT = 5000;
-const char* NODE_ID = "checkpoint-1";
+const char* NODE_ID = "checkpoint-3";
 
 // ---- GATE TIMING & TUNING PARAMETERS ----
 // These are DEFAULTS only. They're fetched from the Pi once at boot, then
@@ -88,6 +89,11 @@ DroneState droneTrackers[256];
 uint8_t lastDroneId = 0;
 int8_t lastDroneRssi = -128;
 unsigned long lastDroneSampleMs = 0; // 0 = never received a sample
+
+// Last time WiFi was confirmed connected, used by the reconnect watchdog
+// to decide when a soft reconnect has clearly failed and a hard cycle is
+// needed. Written from the WiFi event handler and the watchdog task.
+volatile unsigned long lastWiFiConnectedMs = 0;
 
 // Interrupt Service Routine for ESP-NOW packet reception
 void IRAM_ATTR onEspNowReceive(const esp_now_recv_info_t* info,
@@ -375,15 +381,62 @@ void startEspNow() {
   Serial.printf("ESP-NOW listening on WiFi channel %d\n", WiFi.channel());
 }
 
+// Fires on every WiFi state change. Two jobs:
+//  1. On disconnect, kick off a reconnect IMMEDIATELY instead of waiting
+//     for the next watchdog poll - this is what was missing before, where
+//     a weak-signal board would drop and just sit offline for minutes.
+//  2. Log the numeric disconnect reason code, which tells you WHY it
+//     dropped so a recurring problem can be pinned to a real cause:
+//        200 = beacon timeout (weak signal / drifting out of range)
+//        201 = no AP found (AP gone, or channel changed)
+//        8   = assoc leave / 4 = assoc expire (the router kicked it,
+//              often because the signal got too weak)
+//        15  = 4-way handshake timeout / 2 = auth expire (auth issue)
+void applyWiFiRobustness(); // forward declaration; defined just below
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      lastWiFiConnectedMs = millis();
+      // Re-apply on every (re)association - TX power and power-save can
+      // reset when the link re-establishes, and this handler is the one
+      // path every reconnect (soft or hard) passes through.
+      applyWiFiRobustness();
+      Serial.print("[WiFi] Connected, IP: ");
+      Serial.println(WiFi.localIP());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.printf("[WiFi] Dropped (reason %d). Reconnecting...\n",
+                    info.wifi_sta_disconnected.reason);
+      WiFi.reconnect();
+      break;
+    default:
+      break;
+  }
+}
+
+// Applies the settings that make an ESP32 hold a marginal WiFi link:
+// disable modem power-save (the radio must never nap between beacons or a
+// weak-signal board silently misses the AP), and push TX power near max to
+// improve the uplink budget. Call after WiFi.mode() has started the driver.
+void applyWiFiRobustness() {
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  // 80 = 20 dBm (units are 0.25 dBm). Near max without pushing into the
+  // range where current spikes can brown out a board on a weak USB supply.
+  esp_wifi_set_max_tx_power(80);
+}
+
 // Connects to WiFi, retrying with a fresh WiFi.begin() call every 15s
 // instead of hanging forever on a single attempt. Prints the numeric
 // WiFi.status() code on failure so a stuck node can be diagnosed from
 // Serial: 1 = SSID not found (out of range or typo), 4 = wrong password.
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
+  WiFi.onEvent(onWiFiEvent);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
+  applyWiFiRobustness();
 
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print("Connecting to WiFi: ");
@@ -403,9 +456,30 @@ void connectWiFi() {
     }
   }
 
+  lastWiFiConnectedMs = millis();
   Serial.println();
   Serial.print("Connected! ESP32 Gateway IP: ");
   Serial.println(WiFi.localIP());
+}
+
+// Backstop for onWiFiEvent's fast reconnect: if the link is STILL down
+// several seconds later (the soft WiFi.reconnect() got stuck, which is
+// exactly how a board ends up "offline for 7 minutes"), force a full
+// disconnect/begin cycle. Between the event handler and this watchdog, a
+// dropped node recovers in seconds instead of staying dead until reboot.
+void wifiWatchdogTask(void* parameter) {
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED) {
+      lastWiFiConnectedMs = millis();
+    } else if (millis() - lastWiFiConnectedMs > 5000) {
+      Serial.println("[WiFi Watchdog] Down >5s, forcing full reconnect.");
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      applyWiFiRobustness();
+      lastWiFiConnectedMs = millis(); // give this cycle time before forcing another
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
 }
 
 void setup() {
@@ -446,6 +520,18 @@ void setup() {
   connectWiFi();
   fetchSettingsFromPi(); // apply live settings once before the first pass can be detected
   startEspNow();
+
+  // Spawn the WiFi reconnect watchdog AFTER the initial blocking connect,
+  // so it doesn't fight connectWiFi()'s own retry loop during startup.
+  xTaskCreatePinnedToCore(
+      wifiWatchdogTask,
+      "WiFi_Watchdog",
+      4096,
+      nullptr,
+      1,
+      nullptr,
+      0
+  );
 }
 
 void loop() {
