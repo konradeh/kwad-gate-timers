@@ -1,0 +1,119 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+// This must match the WiFi network used by the WROOM.
+// The password is not needed: the XIAO only scans for its radio channel.
+const char* CHECKPOINT_WIFI_SSID = "superstuudio";
+
+const uint8_t DRONE_ID = 1;
+const unsigned long BEACON_INTERVAL_MS = 50;
+const int8_t TX_POWER_QUARTER_DBM = 32;  // 8 dBm
+
+const uint16_t BEACON_MAGIC = 0x4B47;
+const uint8_t BEACON_VERSION = 1;
+const uint8_t BROADCAST_MAC[6] = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+#pragma pack(push, 1)
+struct DroneBeacon {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t drone_id;
+  uint32_t boot_id;
+  uint32_t sequence;
+};
+#pragma pack(pop)
+
+uint8_t radioChannel = 0;
+uint32_t bootId = 0;
+uint32_t sequenceNumber = 0;
+unsigned long lastBeaconMs = 0;
+
+uint8_t findCheckpointChannel() {
+  Serial.print("Scanning for ");
+  Serial.println(CHECKPOINT_WIFI_SSID);
+
+  while (true) {
+    const int networkCount = WiFi.scanNetworks(false, true);
+    for (int index = 0; index < networkCount; index++) {
+      if (WiFi.SSID(index) == CHECKPOINT_WIFI_SSID) {
+        const uint8_t channel =
+            static_cast<uint8_t>(WiFi.channel(index));
+        WiFi.scanDelete();
+        return channel;
+      }
+    }
+
+    WiFi.scanDelete();
+    Serial.println("Checkpoint WiFi not found; retrying...");
+    delay(2000);
+  }
+}
+
+void addBroadcastPeer() {
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, BROADCAST_MAC, sizeof(BROADCAST_MAC));
+  peer.channel = radioChannel;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("FATAL: could not add ESP-NOW broadcast peer");
+    while (true) {
+      delay(1000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.setSleep(false);
+
+  radioChannel = findCheckpointChannel();
+  esp_wifi_set_channel(radioChannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_max_tx_power(TX_POWER_QUARTER_DBM);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("FATAL: ESP-NOW initialization failed");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  addBroadcastPeer();
+  bootId = esp_random();
+
+  Serial.print("XIAO ready. ESP-NOW channel: ");
+  Serial.println(radioChannel);
+}
+
+void loop() {
+  const unsigned long now = millis();
+  if (now - lastBeaconMs < BEACON_INTERVAL_MS) {
+    delay(1);
+    return;
+  }
+
+  lastBeaconMs = now;
+  const DroneBeacon beacon{
+      BEACON_MAGIC,
+      BEACON_VERSION,
+      DRONE_ID,
+      bootId,
+      sequenceNumber++};
+
+  const esp_err_t result =
+      esp_now_send(BROADCAST_MAC,
+                   reinterpret_cast<const uint8_t*>(&beacon),
+                   sizeof(beacon));
+
+  if (result != ESP_OK) {
+    Serial.print("ESP-NOW send failed: ");
+    Serial.println(static_cast<int>(result));
+  }
+}
