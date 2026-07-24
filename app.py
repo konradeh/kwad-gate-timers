@@ -823,11 +823,12 @@ DEBUG_PANEL_HTML = """
             visibleNodes.forEach(n => {
                 const row = document.createElement('div');
                 row.className = 'debug-node-row';
-                const droneLive = n.drone_age_ms !== null && n.drone_age_ms <= 3000;
-                const isClosest = data.drone.online && n.node_id === data.drone.closest_node;
-                const droneInfo = droneLive
-                    ? '<span class="debug-drone-rssi">drone ' + n.drone_rssi + ' dBm &middot; ' + formatMs(n.drone_age_ms) +
-                      (isClosest ? ' <span class="closest-badge">CLOSEST</span>' : '') + '</span>'
+                const heard = n.drones_heard || [];
+                const droneInfo = heard.length
+                    ? '<span class="debug-drone-rssi">' + heard.map(h =>
+                        'Drone ' + h.id + ' &middot; ' + h.rssi + ' dBm' +
+                        (h.is_closest ? ' <span class="closest-badge">CLOSEST</span>' : '')
+                      ).join('<br>') + '</span>'
                     : '';
                 const fwBadge = n.fw_version
                     ? '<span class="fw-badge">fw ' + n.fw_version + '</span>'
@@ -1562,6 +1563,35 @@ def heartbeat():
 def api_debug():
     now = time.time()
 
+    # Resolve drone sightings first, so each node row can list the drones it
+    # is actually hearing (by ID) and flag the ones it is closest to.
+    with drone_sighting_lock:
+        sightings = list(drone_sighting_registry.items())
+
+    heard_by_node = defaultdict(list)
+    best_by_drone = {}
+    for (sighting_node, drone_id), s in sightings:
+        # age_ms was how stale the sample already was when the node sent it;
+        # add the time since we received that heartbeat so it ticks up live.
+        sighting_age = s["age_ms"] + (now - s["last_seen"]) * 1000
+        limit = DRONE_LIVE_TIMEOUT_MS if s["from_array"] else DRONE_LEGACY_TIMEOUT_MS
+        if sighting_age > limit:
+            continue
+
+        heard_by_node[sighting_node].append({
+            "id": drone_id,
+            "rssi": s["rssi"],
+            "age_ms": round(sighting_age),
+        })
+
+        current = best_by_drone.get(drone_id)
+        if current is None or s["rssi"] > current["rssi"]:
+            best_by_drone[drone_id] = {
+                "closest_node": sighting_node,
+                "rssi": s["rssi"],
+                "age_ms": round(sighting_age),
+            }
+
     nodes = []
     with node_registry_lock:
         for node_id, state in sorted(node_registry.items()):
@@ -1575,6 +1605,14 @@ def api_debug():
             live_drone_age_ms = None
             if drone_age_ms is not None:
                 live_drone_age_ms = drone_age_ms + age * 1000
+
+            # Drones this specific node is hearing, loudest first, each
+            # flagged if this node is the closest one to that drone.
+            drones_heard = sorted(heard_by_node.get(node_id, []),
+                                  key=lambda d: d["rssi"], reverse=True)
+            for entry in drones_heard:
+                best = best_by_drone.get(entry["id"])
+                entry["is_closest"] = bool(best and best["closest_node"] == node_id)
 
             nodes.append({
                 "node_id": node_id,
@@ -1590,6 +1628,7 @@ def api_debug():
                 "drone_id": state.get("drone_id"),
                 "drone_rssi": state.get("drone_rssi"),
                 "drone_age_ms": round(live_drone_age_ms) if live_drone_age_ms is not None else None,
+                "drones_heard": drones_heard,
             })
 
     # A checkpoint has "live" drone proximity data if it heard an ESP-NOW
@@ -1612,28 +1651,6 @@ def api_debug():
         "closest_node": closest_node["node_id"] if closest_node else None,
         "closest_rssi": closest_node["drone_rssi"] if closest_node else None,
     }
-
-    # Per-drone status, built from the independent per-(node, drone)
-    # sightings so one drone's report can't erase another's. For each drone
-    # the node currently hearing it loudest wins as its "closest" node.
-    with drone_sighting_lock:
-        sightings = list(drone_sighting_registry.items())
-
-    best_by_drone = {}
-    for (sighting_node, drone_id), s in sightings:
-        # age_ms was how stale the sample already was when the node sent it;
-        # add the time since we received that heartbeat so it ticks up live.
-        sighting_age = s["age_ms"] + (now - s["last_seen"]) * 1000
-        limit = DRONE_LIVE_TIMEOUT_MS if s["from_array"] else DRONE_LEGACY_TIMEOUT_MS
-        if sighting_age > limit:
-            continue
-        current = best_by_drone.get(drone_id)
-        if current is None or s["rssi"] > current["rssi"]:
-            best_by_drone[drone_id] = {
-                "closest_node": sighting_node,
-                "rssi": s["rssi"],
-                "age_ms": round(sighting_age),
-            }
 
     with known_drone_lock:
         all_drone_ids = set(known_drone_ids)
