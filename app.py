@@ -35,7 +35,36 @@ NODE_ONLINE_TIMEOUT_S = 8.0
 
 # A node's live drone-proximity reading (piggybacked on its heartbeat) is
 # considered current if the sample is fresher than this, in milliseconds.
+# Firmware >= 1.3.0 reports EVERY drone it hears on every heartbeat, so a
+# drone missing from that list really is gone and a short timeout is right.
 DRONE_LIVE_TIMEOUT_MS = 3000
+
+# Older firmware can only report ONE drone per heartbeat (the most recently
+# heard one), so with several drones a given one only gets mentioned every
+# few seconds even while flying. A short timeout would make them appear to
+# flicker on and off in turn, so legacy sightings get a longer grace period.
+DRONE_LEGACY_TIMEOUT_MS = 10000
+
+# Independent last-sighting per (node_id, drone_id). Keeping these separate
+# is what stops one drone's report from erasing another's - the single
+# drone slot on the node record gets overwritten every heartbeat.
+drone_sighting_registry = {}
+drone_sighting_lock = threading.Lock()
+
+def record_drone_sighting(node_id, drone_id, rssi, age_ms, from_array):
+    if drone_id is None or rssi is None:
+        return
+    try:
+        entry = {
+            "rssi": int(rssi),
+            "age_ms": float(age_ms or 0),
+            "last_seen": time.time(),
+            "from_array": from_array,
+        }
+    except (TypeError, ValueError):
+        return
+    with drone_sighting_lock:
+        drone_sighting_registry[(node_id, str(drone_id))] = entry
 
 # ESP32 WiFi disconnect reason codes -> human labels, so the debug panel can
 # explain WHY a node dropped instead of just showing a bare number. Only the
@@ -1507,11 +1536,19 @@ def heartbeat():
 
     # Newer firmware reports EVERY drone this node currently hears, which is
     # what per-drone online status is built from.
-    if isinstance(data.get("drones"), list):
-        extra["drones"] = data["drones"]
-        for entry in data["drones"]:
+    drone_array = data.get("drones")
+    if isinstance(drone_array, list):
+        extra["drones"] = drone_array
+        for entry in drone_array:
             if isinstance(entry, dict):
                 remember_drone(entry.get("id"))
+                record_drone_sighting(node_id, entry.get("id"), entry.get("rssi"),
+                                      entry.get("age_ms"), from_array=True)
+    elif "drone_rssi" in data:
+        # Legacy firmware: only one drone per heartbeat, so record it into
+        # its own slot rather than letting it overwrite the other drones.
+        record_drone_sighting(node_id, data.get("drone_id"), data.get("drone_rssi"),
+                              data.get("drone_age_ms"), from_array=False)
     record_contact(node_id, "heartbeat", **extra)
 
     # Piggyback the node's current effective settings on the heartbeat
@@ -1526,10 +1563,6 @@ def api_debug():
     now = time.time()
 
     nodes = []
-    # Flattened (node_id, drone_id, rssi, live_age_ms) rows gathered from
-    # every node's per-drone report, used to build per-drone status below.
-    drone_sightings = []
-
     with node_registry_lock:
         for node_id, state in sorted(node_registry.items()):
             age = now - state["last_seen"]
@@ -1542,36 +1575,6 @@ def api_debug():
             live_drone_age_ms = None
             if drone_age_ms is not None:
                 live_drone_age_ms = drone_age_ms + age * 1000
-
-            node_drones = state.get("drones")
-            if isinstance(node_drones, list) and node_drones:
-                for entry in node_drones:
-                    if not isinstance(entry, dict):
-                        continue
-                    try:
-                        sighting_age = float(entry.get("age_ms", 0)) + age * 1000
-                        drone_sightings.append((
-                            node_id,
-                            str(entry.get("id")),
-                            int(entry.get("rssi")),
-                            sighting_age,
-                        ))
-                    except (TypeError, ValueError):
-                        continue
-            elif state.get("drone_id") is not None and state.get("drone_rssi") is not None:
-                # Firmware older than 1.3.0 reports only the single most
-                # recently heard drone. Fall back to it so drone status works
-                # without every checkpoint having to be reflashed first - such
-                # a node just can't distinguish multiple drones at once.
-                try:
-                    drone_sightings.append((
-                        node_id,
-                        str(state.get("drone_id")),
-                        int(state.get("drone_rssi")),
-                        live_drone_age_ms if live_drone_age_ms is not None else 0.0,
-                    ))
-                except (TypeError, ValueError):
-                    pass
 
             nodes.append({
                 "node_id": node_id,
@@ -1610,17 +1613,25 @@ def api_debug():
         "closest_rssi": closest_node["drone_rssi"] if closest_node else None,
     }
 
-    # Per-drone status: for each drone, the node currently hearing it
-    # loudest wins as its "closest" node.
+    # Per-drone status, built from the independent per-(node, drone)
+    # sightings so one drone's report can't erase another's. For each drone
+    # the node currently hearing it loudest wins as its "closest" node.
+    with drone_sighting_lock:
+        sightings = list(drone_sighting_registry.items())
+
     best_by_drone = {}
-    for node_id, drone_id, rssi, sighting_age in drone_sightings:
-        if sighting_age > DRONE_LIVE_TIMEOUT_MS:
+    for (sighting_node, drone_id), s in sightings:
+        # age_ms was how stale the sample already was when the node sent it;
+        # add the time since we received that heartbeat so it ticks up live.
+        sighting_age = s["age_ms"] + (now - s["last_seen"]) * 1000
+        limit = DRONE_LIVE_TIMEOUT_MS if s["from_array"] else DRONE_LEGACY_TIMEOUT_MS
+        if sighting_age > limit:
             continue
         current = best_by_drone.get(drone_id)
-        if current is None or rssi > current["rssi"]:
+        if current is None or s["rssi"] > current["rssi"]:
             best_by_drone[drone_id] = {
-                "closest_node": node_id,
-                "rssi": rssi,
+                "closest_node": sighting_node,
+                "rssi": s["rssi"],
                 "age_ms": round(sighting_age),
             }
 
