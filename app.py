@@ -1543,19 +1543,35 @@ def api_debug():
             if drone_age_ms is not None:
                 live_drone_age_ms = drone_age_ms + age * 1000
 
-            for entry in (state.get("drones") or []):
-                if not isinstance(entry, dict):
-                    continue
+            node_drones = state.get("drones")
+            if isinstance(node_drones, list) and node_drones:
+                for entry in node_drones:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        sighting_age = float(entry.get("age_ms", 0)) + age * 1000
+                        drone_sightings.append((
+                            node_id,
+                            str(entry.get("id")),
+                            int(entry.get("rssi")),
+                            sighting_age,
+                        ))
+                    except (TypeError, ValueError):
+                        continue
+            elif state.get("drone_id") is not None and state.get("drone_rssi") is not None:
+                # Firmware older than 1.3.0 reports only the single most
+                # recently heard drone. Fall back to it so drone status works
+                # without every checkpoint having to be reflashed first - such
+                # a node just can't distinguish multiple drones at once.
                 try:
-                    sighting_age = float(entry.get("age_ms", 0)) + age * 1000
                     drone_sightings.append((
                         node_id,
-                        str(entry.get("id")),
-                        int(entry.get("rssi")),
-                        sighting_age,
+                        str(state.get("drone_id")),
+                        int(state.get("drone_rssi")),
+                        live_drone_age_ms if live_drone_age_ms is not None else 0.0,
                     ))
                 except (TypeError, ValueError):
-                    continue
+                    pass
 
             nodes.append({
                 "node_id": node_id,
