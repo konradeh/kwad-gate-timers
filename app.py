@@ -91,6 +91,17 @@ def record_contact(node_id, kind, **extra):
 drone_state = {}
 drone_state_lock = threading.Lock()
 
+# Every drone_id ever reported, so a drone that has gone quiet still shows
+# in the UI as offline rather than silently vanishing from the list.
+known_drone_ids = set()
+known_drone_lock = threading.Lock()
+
+def remember_drone(drone_id):
+    if drone_id is None:
+        return
+    with known_drone_lock:
+        known_drone_ids.add(str(drone_id))
+
 # ---- Per-checkpoint gate-timing settings ----
 # These mirror the tunable constants in wroom_code_v2.ino. Firmware fetches
 # its own settings from GET /api/settings/<node_id> on boot and re-polls
@@ -535,16 +546,6 @@ BASE_STYLE = """
 
         .debug-close:hover { color: var(--accent); border-color: var(--accent); }
 
-        .debug-drone {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 12px 18px;
-            border-bottom: 1px solid var(--hairline);
-            font-size: 12px;
-            background: var(--bg);
-        }
-
         .debug-filter {
             padding: 12px 18px;
             border-bottom: 1px solid var(--hairline);
@@ -685,7 +686,9 @@ DEBUG_PANEL_HTML = """
             <div class="eyebrow">Node connectivity</div>
             <button class="debug-close" onclick="document.getElementById('debugPanel').classList.remove('open')">Close</button>
         </div>
-        <div class="debug-drone" id="debugDrone"></div>
+        <div class="debug-section" id="debugDrones">
+            <div class="debug-section-label">Drones</div>
+        </div>
         <div class="debug-filter">
             <select id="debugNodeFilter" onchange="debugTick()">
                 <option value="__all__">All checkpoints</option>
@@ -732,15 +735,27 @@ DEBUG_PANEL_HTML = """
                 return;
             }
 
-            const droneEl = document.getElementById('debugDrone');
-            if (data.drone.online) {
-                droneEl.innerHTML =
-                    '<span class="debug-dot online"></span>' +
-                    '<span>Drone online &middot; closest to <strong>' + data.drone.closest_node +
-                    '</strong> (' + data.drone.closest_rssi + ' dBm)</span>';
-            } else {
-                droneEl.innerHTML = '<span class="debug-dot offline"></span><span>Drone offline &mdash; no recent beacon heard by any node</span>';
+            const dronesEl = document.getElementById('debugDrones');
+            const droneList = data.drones || [];
+            const onlineCount = droneList.filter(d => d.online).length;
+            dronesEl.innerHTML = '<div class="debug-section-label">Drones &middot; ' +
+                onlineCount + '/' + droneList.length + ' online</div>';
+
+            if (droneList.length === 0) {
+                dronesEl.innerHTML += '<div class="debug-empty">No drones detected yet. Power one on within range of a checkpoint.</div>';
             }
+            droneList.forEach(d => {
+                const row = document.createElement('div');
+                row.className = 'debug-node-row';
+                const detail = d.online
+                    ? '<span class="debug-node-meta">@ ' + d.closest_node + ' &middot; ' + d.rssi + ' dBm</span>'
+                    : '<span class="debug-node-meta">no beacon heard</span>';
+                row.innerHTML =
+                    '<span class="debug-dot ' + (d.online ? 'online' : 'offline') + '"></span>' +
+                    '<span class="debug-node-id" style="color:' + d.color + '">Drone ' + d.id + '</span>' +
+                    detail;
+                dronesEl.appendChild(row);
+            });
 
             const filterEl = document.getElementById('debugNodeFilter');
             const selected = filterEl.value || '__all__';
@@ -1462,6 +1477,7 @@ def checkpoint():
                 "sequence": data.get("sequence"),
             }
 
+    remember_drone(drone_id)
     record_contact(node_id, "checkpoint", drone_id=drone_id, rssi=event["rssi"])
 
     print(f"[checkpoint] {event}")
@@ -1487,6 +1503,15 @@ def heartbeat():
         extra["drone_id"] = data.get("drone_id")
         extra["drone_rssi"] = data.get("drone_rssi")
         extra["drone_age_ms"] = data.get("drone_age_ms")
+        remember_drone(data.get("drone_id"))
+
+    # Newer firmware reports EVERY drone this node currently hears, which is
+    # what per-drone online status is built from.
+    if isinstance(data.get("drones"), list):
+        extra["drones"] = data["drones"]
+        for entry in data["drones"]:
+            if isinstance(entry, dict):
+                remember_drone(entry.get("id"))
     record_contact(node_id, "heartbeat", **extra)
 
     # Piggyback the node's current effective settings on the heartbeat
@@ -1501,6 +1526,10 @@ def api_debug():
     now = time.time()
 
     nodes = []
+    # Flattened (node_id, drone_id, rssi, live_age_ms) rows gathered from
+    # every node's per-drone report, used to build per-drone status below.
+    drone_sightings = []
+
     with node_registry_lock:
         for node_id, state in sorted(node_registry.items()):
             age = now - state["last_seen"]
@@ -1513,6 +1542,20 @@ def api_debug():
             live_drone_age_ms = None
             if drone_age_ms is not None:
                 live_drone_age_ms = drone_age_ms + age * 1000
+
+            for entry in (state.get("drones") or []):
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    sighting_age = float(entry.get("age_ms", 0)) + age * 1000
+                    drone_sightings.append((
+                        node_id,
+                        str(entry.get("id")),
+                        int(entry.get("rssi")),
+                        sighting_age,
+                    ))
+                except (TypeError, ValueError):
+                    continue
 
             nodes.append({
                 "node_id": node_id,
@@ -1551,7 +1594,44 @@ def api_debug():
         "closest_rssi": closest_node["drone_rssi"] if closest_node else None,
     }
 
-    return jsonify({"nodes": nodes, "log": log, "drone": drone_status})
+    # Per-drone status: for each drone, the node currently hearing it
+    # loudest wins as its "closest" node.
+    best_by_drone = {}
+    for node_id, drone_id, rssi, sighting_age in drone_sightings:
+        if sighting_age > DRONE_LIVE_TIMEOUT_MS:
+            continue
+        current = best_by_drone.get(drone_id)
+        if current is None or rssi > current["rssi"]:
+            best_by_drone[drone_id] = {
+                "closest_node": node_id,
+                "rssi": rssi,
+                "age_ms": round(sighting_age),
+            }
+
+    with known_drone_lock:
+        all_drone_ids = set(known_drone_ids)
+    all_drone_ids |= set(best_by_drone.keys())
+
+    def drone_sort_key(value):
+        # Numeric IDs sort naturally; anything else falls back to string.
+        try:
+            return (0, int(value), "")
+        except (TypeError, ValueError):
+            return (1, 0, str(value))
+
+    drones = []
+    for drone_id in sorted(all_drone_ids, key=drone_sort_key):
+        seen = best_by_drone.get(drone_id)
+        drones.append({
+            "id": drone_id,
+            "online": seen is not None,
+            "closest_node": seen["closest_node"] if seen else None,
+            "rssi": seen["rssi"] if seen else None,
+            "age_ms": seen["age_ms"] if seen else None,
+            "color": get_drone_color(drone_id),
+        })
+
+    return jsonify({"nodes": nodes, "log": log, "drone": drone_status, "drones": drones})
 
 @app.route("/settings")
 def settings_page():

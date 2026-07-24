@@ -7,7 +7,7 @@
 // it. Reported on every heartbeat so the site's debug panel can show which
 // firmware version each physical node is actually running - no more
 // guessing which boards still need a reflash by diffing behavior.
-const char* FW_VERSION = "1.2.1";
+const char* FW_VERSION = "1.3.0";
 
 // ---- NETWORK CONFIGURATION ----
 const char* WIFI_SSID = "superstuudio";
@@ -35,6 +35,12 @@ unsigned long HEARTBEAT_INTERVAL_MS = 1000; // How often to tell the Pi this nod
 // each a fresh handshake, no keep-alive) a weak-signal board doesn't get
 // enough time between requests to recover from packet loss, which is what
 // was causing "read Timeout" / "connection refused" cascades.
+
+// A drone is included in this node's heartbeat report if it was heard
+// within this window. Slightly longer than the heartbeat interval so a
+// drone isn't dropped from the list between two beacons.
+const unsigned long DRONE_REPORT_WINDOW_MS = 5000;
+const uint8_t MAX_REPORTED_DRONES = 8;
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;
@@ -69,6 +75,12 @@ struct DroneState {
   uint8_t weakSampleCount = 0;
   unsigned long lastSampleMs = 0;
   unsigned long lastPassEmittedMs = 0;
+
+  // Updated on EVERY beacon from this drone, regardless of gate state, so
+  // the heartbeat can report which drones this node is currently hearing.
+  // lastHeardMs == 0 means this drone has never been heard.
+  int8_t lastHeardRssi = -128;
+  unsigned long lastHeardMs = 0;
 
   uint32_t lastBootId = 0;
   uint32_t lastSequence = 0;
@@ -206,6 +218,11 @@ void processSample(const ReceivedSample& sample) {
   lastDroneId = sample.drone_id;
   lastDroneRssi = sample.rssi;
   lastDroneSampleMs = sample.received_at_ms;
+
+  // Per-drone version of the same thing, so a node flying near three
+  // drones reports all three instead of whichever it happened to hear last.
+  state.lastHeardRssi = sample.rssi;
+  state.lastHeardMs = sample.received_at_ms;
 
   state.haveLastBeacon = true;
   state.lastBootId = sample.boot_id;
@@ -361,6 +378,28 @@ void heartbeatTask(void* parameter) {
                    ",\"drone_rssi\":" + lastDroneRssi +
                    ",\"drone_age_ms\":" + (millis() - lastDroneSampleMs);
       }
+
+      // Report EVERY drone this node is currently hearing, so the site can
+      // show per-drone online status rather than just the most recent one.
+      const unsigned long nowMs = millis();
+      String dronesJson = "";
+      uint8_t reported = 0;
+      for (int id = 0; id < 256 && reported < MAX_REPORTED_DRONES; id++) {
+        const DroneState& st = droneTrackers[id];
+        if (st.lastHeardMs == 0) continue;
+        const unsigned long heardAge = nowMs - st.lastHeardMs;
+        if (heardAge > DRONE_REPORT_WINDOW_MS) continue;
+
+        if (reported > 0) dronesJson += ",";
+        dronesJson += String("{\"id\":") + id +
+                      ",\"rssi\":" + st.lastHeardRssi +
+                      ",\"age_ms\":" + heardAge + "}";
+        reported++;
+      }
+      if (reported > 0) {
+        payload += ",\"drones\":[" + dronesJson + "]";
+      }
+
       payload += "}";
 
       int httpCode = http.POST(payload);
