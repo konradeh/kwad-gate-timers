@@ -6,14 +6,23 @@
 // never talks to the Pi over HTTP (ESP-NOW broadcast only), so unlike the
 // checkpoint firmware this version can't be reported automatically -
 // check it via the serial monitor if you need to confirm what's flashed.
-const char* FW_VERSION = "1.0.0";
+const char* FW_VERSION = "1.1.0";
 
 // Must match the WiFi network used by the receiver gateway.
 const char* CHECKPOINT_WIFI_SSID = "superstuudio";
 
 const uint8_t DRONE_ID = 1;
 const unsigned long BEACON_INTERVAL_MS = 10; // High frequency (100 Hz) for high-speed gate crossing
-const int8_t TX_POWER_QUARTER_DBM = 32;       // 8 dBm power setting
+
+// Beacon transmit power, in quarter-dBm (valid range 8-84, i.e. 2-21 dBm).
+// This is the COARSE control over how large each gate's detection zone is:
+// lower power makes RSSI drop off over a much shorter distance, which keeps
+// gates from triggering from far away. That matters most airborne, where
+// clear line-of-sight keeps the signal strong far past the gate.
+// Pair this with the per-node "Enter RSSI" on the Settings page, which is
+// the FINE control and can be tuned live without reflashing anything.
+//   32 = 8 dBm (previous, large zone)   20 = 5 dBm (tighter)   8 = 2 dBm (tightest)
+const int8_t TX_POWER_QUARTER_DBM = 20;
 
 const uint16_t BEACON_MAGIC = 0x4B47;
 const uint8_t BEACON_VERSION = 1;

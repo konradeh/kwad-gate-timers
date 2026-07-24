@@ -1,0 +1,18 @@
+[Unit]
+Description=kwad gate timer server
+# Wait for the network to actually be up, otherwise binding 0.0.0.0 and
+# reaching checkpoints can race with DHCP on a cold boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kwad
+WorkingDirectory=/home/kwad/kwad
+Environment=KWAD_DEBUG=0
+ExecStart=/home/kwad/kwad/venv/bin/python /home/kwad/kwad/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
