@@ -11,43 +11,32 @@ import time
 
 app = Flask(__name__)
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.1.0"
 
-# In-memory event log - list of dicts: {node_id, timestamp, received_at, drone_id, rssi}
+# -----------------------------------------------------------------------------
+# Global Locks and In-Memory State
+# -----------------------------------------------------------------------------
+
+# Telemetry log - list of raw pass dicts: {node_id, timestamp, received_at, drone_id, rssi}
 events = []
 events_lock = threading.Lock()
 
-# Last-contact registry per node_id, updated by both /checkpoint and
-# /api/heartbeat. This is what powers the debug panel's online/offline dots.
+# Node connectivity registry
 # {"checkpoint-1": {"last_seen": <epoch>, "last_type": "heartbeat", "ip": "...", "wifi_rssi": -50}}
 node_registry = {}
 node_registry_lock = threading.Lock()
 
-# Rolling log of requests, kept PER NODE (not one shared buffer) so a node
-# heartbeating fast can't crowd another node's entries out of view. Each
-# node gets its own capped history; the debug panel merges/filters them.
+# Rolling log of raw HTTP requests kept PER NODE
 raw_log_by_node = defaultdict(lambda: deque(maxlen=30))
 raw_log_lock = threading.Lock()
 
-# A node is considered "online" if we've heard from it (heartbeat or
-# checkpoint event) within this many seconds.
+# Timeouts
 NODE_ONLINE_TIMEOUT_S = 8.0
-
-# A node's live drone-proximity reading (piggybacked on its heartbeat) is
-# considered current if the sample is fresher than this, in milliseconds.
-# Firmware >= 1.3.0 reports EVERY drone it hears on every heartbeat, so a
-# drone missing from that list really is gone and a short timeout is right.
 DRONE_LIVE_TIMEOUT_MS = 3000
-
-# Older firmware can only report ONE drone per heartbeat (the most recently
-# heard one), so with several drones a given one only gets mentioned every
-# few seconds even while flying. A short timeout would make them appear to
-# flicker on and off in turn, so legacy sightings get a longer grace period.
 DRONE_LEGACY_TIMEOUT_MS = 10000
+DRONE_TIMEOUT_S = 6.0
 
-# Independent last-sighting per (node_id, drone_id). Keeping these separate
-# is what stops one drone's report from erasing another's - the single
-# drone slot on the node record gets overwritten every heartbeat.
+# Sighting registry per (node_id, drone_id)
 drone_sighting_registry = {}
 drone_sighting_lock = threading.Lock()
 
@@ -66,9 +55,7 @@ def record_drone_sighting(node_id, drone_id, rssi, age_ms, from_array):
     with drone_sighting_lock:
         drone_sighting_registry[(node_id, str(drone_id))] = entry
 
-# ESP32 WiFi disconnect reason codes -> human labels, so the debug panel can
-# explain WHY a node dropped instead of just showing a bare number. Only the
-# common ones are mapped; anything else falls back to "reason N".
+# WiFi Disconnect Reasons
 WIFI_DISCONNECT_REASONS = {
     1: "unspecified",
     2: "auth expired",
@@ -94,9 +81,6 @@ def disconnect_reason_label(reason):
 def record_contact(node_id, kind, **extra):
     now = time.time()
     with node_registry_lock:
-        # Merge onto the previous entry rather than replacing it outright -
-        # a /checkpoint pass event doesn't carry wifi_rssi/fw_version, and
-        # a plain replace would wipe those out until the next heartbeat.
         previous = node_registry.get(node_id, {})
         node_registry[node_id] = {
             **previous,
@@ -115,26 +99,24 @@ def record_contact(node_id, kind, **extra):
             "detail": extra,
         })
 
-# Latest known state per drone, keyed by drone_id (as string).
-# {"1": {"node_id": "checkpoint-1", "rssi": -58, "last_seen": <epoch>, "sequence": 123}}
+# Latest drone state
 drone_state = {}
 drone_state_lock = threading.Lock()
 
-# Every drone_id ever reported, so a drone that has gone quiet still shows
-# in the UI as offline rather than silently vanishing from the list.
 known_drone_ids = set()
 known_drone_lock = threading.Lock()
 
 def remember_drone(drone_id):
     if drone_id is None:
         return
+    d_str = str(drone_id)
     with known_drone_lock:
-        known_drone_ids.add(str(drone_id))
+        known_drone_ids.add(d_str)
 
-# ---- Per-checkpoint gate-timing settings ----
-# These mirror the tunable constants in wroom_code_v2.ino. Firmware fetches
-# its own settings from GET /api/settings/<node_id> on boot and re-polls
-# periodically, so changes made here take effect without re-flashing.
+# -----------------------------------------------------------------------------
+# Checkpoint Settings Configuration
+# -----------------------------------------------------------------------------
+
 DEFAULT_SETTINGS = {
     "enter_rssi": -62,
     "exit_rssi": -72,
@@ -144,8 +126,6 @@ DEFAULT_SETTINGS = {
     "heartbeat_interval_ms": 1000,
 }
 
-# Bounds used to sanity-check values coming from the settings form before
-# they're handed to a physical board.
 SETTINGS_BOUNDS = {
     "enter_rssi": (-100, 0),
     "exit_rssi": (-100, 0),
@@ -167,8 +147,6 @@ def load_node_settings():
 def save_node_settings(data):
     SETTINGS_FILE.write_text(json.dumps(data, indent=2))
 
-# Per-node overrides on top of DEFAULT_SETTINGS, persisted to disk so a Pi
-# reboot doesn't silently reset every checkpoint back to defaults.
 node_settings = load_node_settings()
 
 def get_effective_settings(node_id):
@@ -177,8 +155,7 @@ def get_effective_settings(node_id):
         effective.update(node_settings.get(node_id, {}))
     return effective
 
-# Where each checkpoint node sits on the radar square, as a percentage
-# (0-100) from the top-left. Edit this to match your physical track layout.
+# Radar map layout positions
 NODE_POSITIONS = {
     "checkpoint-1": (50.0, 15.0),
     "checkpoint-2": (83.3, 39.2),
@@ -187,8 +164,6 @@ NODE_POSITIONS = {
     "checkpoint-5": (16.7, 39.2),
 }
 
-# Any node_id not listed above gets placed automatically on a circle so it
-# still shows up on the radar instead of being dropped.
 def get_node_position(node_id):
     if node_id in NODE_POSITIONS:
         return NODE_POSITIONS[node_id]
@@ -196,24 +171,196 @@ def get_node_position(node_id):
     angle = math.radians(h % 360)
     return (50 + 35 * math.cos(angle), 50 + 35 * math.sin(angle))
 
-# Colors cycled through for distinguishing multiple drones on the radar.
-# Green is reserved for brand chrome, so drones stay visually distinct from
-# the site's own accent color.
-DRONE_COLORS = ["#ffb545", "#3fb3c9", "#c94fd6", "#ff6f59", "#8f7cff", "#f2d94e"]
+DRONE_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ec4899", "#8b5cf6", "#06b6d4"]
 
 def get_drone_color(drone_id):
     try:
         idx = int(drone_id)
     except (TypeError, ValueError):
-        idx = abs(hash(drone_id))
+        idx = abs(hash(str(drone_id)))
     return DRONE_COLORS[idx % len(DRONE_COLORS)]
 
-# How long (seconds) a drone stays visible on the radar after its last
-# reported pass before fading out entirely.
-DRONE_TIMEOUT_S = 6.0
+# -----------------------------------------------------------------------------
+# Race Engine State & Gate Order Enforcement
+# -----------------------------------------------------------------------------
 
-# Hand-traced from the kwad brand sheet: rounded-square gate + diagonal
-# flight path + dot. Uses currentColor so CSS controls the color per page.
+race_lock = threading.Lock()
+
+# Global Race State
+race_state = {
+    "status": "STOPPED",  # "STOPPED", "RUNNING", "FINISHED"
+    "start_time": None,
+    "end_time": None,
+    "target_laps": 3,
+    "gate_order": ["checkpoint-1", "checkpoint-2", "checkpoint-3"],
+    "enforce_gate_order": True,
+    "min_lap_time_s": 1.0,
+}
+
+# Per-drone race telemetry
+drone_race_data = {}
+
+# Recent race audit log
+race_log = deque(maxlen=100)
+
+def init_drone_for_race(drone_id):
+    drone_id = str(drone_id)
+    if drone_id not in drone_race_data:
+        drone_race_data[drone_id] = {
+            "drone_id": drone_id,
+            "status": "READY",
+            "completed_laps": 0,
+            "next_gate_index": 0,
+            "last_gate": None,
+            "last_pass_time": None,
+            "lap_start_time": race_state["start_time"] or time.time(),
+            "laps": [],
+            "best_lap": None,
+            "total_time": None,
+            "invalid_passes": 0,
+        }
+    return drone_race_data[drone_id]
+
+def process_race_checkpoint(node_id, drone_id, rssi, time_str):
+    now = time.time()
+    drone_id = str(drone_id)
+
+    with race_lock:
+        d_data = init_drone_for_race(drone_id)
+
+        # 1. PRACTICE MODE (Race is STOPPED)
+        if race_state["status"] != "RUNNING":
+            rssi_str = f"{rssi} dBm" if rssi is not None else "n/a"
+            log_entry = {
+                "time": time_str,
+                "ts": now,
+                "drone_id": drone_id,
+                "node_id": node_id,
+                "type": "PRACTICE_PASS",
+                "message": f"[PRACTICE] Drone {drone_id} passed {node_id} (RSSI: {rssi_str})",
+                "valid": True
+            }
+            race_log.appendleft(log_entry)
+            return {
+                "valid": True,
+                "mode": "PRACTICE",
+                "reason": "Practice pass recorded (Race stopped)",
+                "race_status": race_state["status"]
+            }
+
+        # 2. FINISHED DRONE
+        if d_data["status"] == "FINISHED":
+            return {
+                "valid": False,
+                "reason": f"Drone {drone_id} has already finished the race",
+                "race_status": race_state["status"]
+            }
+
+        # 3. TIMED RACE MODE (RUNNING)
+        gate_order = race_state["gate_order"]
+        enforce = race_state["enforce_gate_order"]
+
+        if not gate_order:
+            gate_order = [node_id]
+
+        expected_gate = gate_order[d_data["next_gate_index"] % len(gate_order)]
+
+        is_valid = True
+        if enforce and node_id != expected_gate:
+            is_valid = False
+
+        if not is_valid:
+            d_data["invalid_passes"] += 1
+            log_entry = {
+                "time": time_str,
+                "ts": now,
+                "drone_id": drone_id,
+                "node_id": node_id,
+                "expected_gate": expected_gate,
+                "type": "SKIPPED_GATE",
+                "message": f"Drone {drone_id} hit {node_id} but expected {expected_gate} (Gate {d_data['next_gate_index'] + 1}/{len(gate_order)})",
+                "valid": False
+            }
+            race_log.appendleft(log_entry)
+            return {
+                "valid": False,
+                "reason": f"Skipped gate. Expected {expected_gate}, got {node_id}",
+                "expected_gate": expected_gate,
+                "actual_gate": node_id
+            }
+
+        d_data["status"] = "RACING"
+        d_data["last_gate"] = node_id
+        d_data["last_pass_time"] = now
+
+        current_gate_idx = d_data["next_gate_index"]
+        next_gate_idx = (current_gate_idx + 1) % len(gate_order)
+        d_data["next_gate_index"] = next_gate_idx
+
+        lap_completed = False
+        lap_time = None
+
+        if next_gate_idx == 0:
+            lap_start = d_data["lap_start_time"] or race_state["start_time"] or now
+            lap_time = round(now - lap_start, 3)
+
+            if lap_time >= race_state["min_lap_time_s"]:
+                lap_completed = True
+                d_data["completed_laps"] += 1
+                d_data["lap_start_time"] = now
+
+                lap_record = {
+                    "lap_num": d_data["completed_laps"],
+                    "lap_time": lap_time,
+                    "timestamp": time_str
+                }
+                d_data["laps"].append(lap_record)
+
+                if d_data["best_lap"] is None or lap_time < d_data["best_lap"]:
+                    d_data["best_lap"] = lap_time
+
+                if d_data["completed_laps"] >= race_state["target_laps"]:
+                    d_data["status"] = "FINISHED"
+                    total_t = round(now - race_state["start_time"], 3)
+                    d_data["total_time"] = total_t
+
+        if lap_completed:
+            msg = f"Drone {drone_id} completed LAP {d_data['completed_laps']}/{race_state['target_laps']} in {lap_time:.2f}s"
+            if d_data["status"] == "FINISHED":
+                msg += " - FINISHED RACE!"
+            entry_type = "LAP_COMPLETE"
+        else:
+            gate_num = current_gate_idx + 1
+            msg = f"Drone {drone_id} passed Gate {gate_num}/{len(gate_order)} ({node_id})"
+            entry_type = "GATE_PASS"
+
+        log_entry = {
+            "time": time_str,
+            "ts": now,
+            "drone_id": drone_id,
+            "node_id": node_id,
+            "expected_gate": expected_gate,
+            "type": entry_type,
+            "message": msg,
+            "valid": True,
+            "lap_completed": lap_completed,
+            "lap_time": lap_time,
+            "completed_laps": d_data["completed_laps"]
+        }
+        race_log.appendleft(log_entry)
+
+        return {
+            "valid": True,
+            "lap_completed": lap_completed,
+            "lap_time": lap_time,
+            "completed_laps": d_data["completed_laps"],
+            "status": d_data["status"]
+        }
+
+# -----------------------------------------------------------------------------
+# Base Layout & Templates
+# -----------------------------------------------------------------------------
+
 KWAD_LOGO_SVG = """<svg class="brand-mark" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" fill="none">
 <rect x="26" y="26" width="46" height="46" rx="12" stroke="currentColor" stroke-width="9"/>
 <path d="M18 84C22 80 26 78 30 72L76 26" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
@@ -221,1278 +368,1348 @@ KWAD_LOGO_SVG = """<svg class="brand-mark" viewBox="0 0 100 100" xmlns="http://w
 </svg>"""
 
 def topbar(active):
-    links = [("/", "Leaderboard"), ("/radar", "Radar"), ("/settings", "Settings")]
+    links = [("/", "Race Control"), ("/radar", "Radar"), ("/settings", "Gate Settings")]
     nav_html = "\n".join(
-        f'<a href="{href}" class="{"active" if label == active else ""}">{label}</a>'
+        f'<a href="{href}" class="nav-item {"active" if label == active else ""}">{label}</a>'
         for href, label in links
     )
     return f"""
-    <div class="topbar">
+    <header class="topbar">
         <a href="/" class="brand">
             {KWAD_LOGO_SVG}
-            <span class="brand-name">kwad</span>
+            <span class="brand-title">kwad <span class="brand-sub">race control</span></span>
             <span class="brand-version">v{APP_VERSION}</span>
         </a>
-        <div class="nav">
+        <nav class="nav">
             {nav_html}
-        </div>
-    </div>
+        </nav>
+    </header>
     """
 
 BASE_STYLE = """
-        :root {
-            --bg: #0e1210;
-            --panel: #151b17;
-            --hairline: #26302a;
-            --paper: #ece7de;
-            --muted: #7c8790;
-            --accent: #2ee06f;
-            --accent-soft: rgba(46, 224, 111, 0.14);
-        }
-
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-
-        body {
-            font-family: 'JetBrains Mono', monospace;
-            background: var(--bg);
-            color: var(--paper);
-            padding: 48px 20px;
-            min-height: 100vh;
-        }
-
-        .wrap { max-width: 880px; margin: 0 auto; }
-
-        .panel {
-            position: relative;
-            border: 1px solid var(--hairline);
-            background: var(--panel);
-            padding: 28px 30px;
-            margin-bottom: 22px;
-        }
-
-        .panel::before, .panel::after {
-            content: '';
-            position: absolute;
-            width: 12px; height: 12px;
-            border: 1.5px solid var(--muted);
-            opacity: 0.6;
-        }
-        .panel::before { top: -1px; left: -1px; border-right: none; border-bottom: none; }
-        .panel::after  { bottom: -1px; right: -1px; border-left: none; border-top: none; }
-
-        .eyebrow {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-            font-weight: 500;
-            letter-spacing: 3px;
-            text-transform: uppercase;
-            color: var(--muted);
-        }
-
-        .title-row {
-            display: flex;
-            align-items: baseline;
-            gap: 12px;
-            margin-top: 8px;
-            flex-wrap: wrap;
-        }
-
-        h1 {
-            font-family: 'Space Grotesk', sans-serif;
-            font-size: 30px;
-            font-weight: 700;
-            letter-spacing: 0.3px;
-        }
-
-        .live {
-            display: inline-flex;
-            align-items: center;
-            gap: 7px;
-            font-size: 11px;
-            letter-spacing: 2px;
-            color: var(--accent);
-            text-transform: uppercase;
-            font-weight: 500;
-        }
-
-        .live-dot {
-            width: 7px; height: 7px;
-            border-radius: 50%;
-            background: var(--accent);
-            box-shadow: 0 0 6px rgba(46, 224, 111, 0.7);
-            animation: pulse 1.6s ease-in-out infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-
-        @media (prefers-reduced-motion: reduce) {
-            .live-dot { animation: none; }
-        }
-
-        .subhead {
-            margin-top: 10px;
-            font-size: 13px;
-            color: var(--muted);
-            max-width: 46ch;
-        }
-
-        .topbar {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 16px;
-            max-width: 880px;
-            margin: 0 auto 18px;
-            flex-wrap: wrap;
-        }
-
-        .brand {
-            display: flex;
-            align-items: center;
-            gap: 9px;
-            text-decoration: none;
-            color: var(--paper);
-        }
-
-        .brand-mark {
-            width: 24px;
-            height: 24px;
-            color: var(--accent);
-            flex-shrink: 0;
-        }
-
-        .brand-name {
-            font-family: 'Space Grotesk', sans-serif;
-            font-size: 17px;
-            font-weight: 700;
-            letter-spacing: 0.2px;
-            color: var(--paper);
-        }
-
-        .brand-version {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 10px;
-            letter-spacing: 1px;
-            color: var(--muted);
-            border: 1px solid var(--hairline);
-            padding: 2px 6px;
-            border-radius: 3px;
-        }
-
-        .nav {
-            display: flex;
-            gap: 4px;
-        }
-
-        .nav a {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            color: var(--muted);
-            text-decoration: none;
-            padding: 8px 16px;
-            border: 1px solid var(--hairline);
-            background: var(--panel);
-        }
-
-        .nav a.active {
-            color: var(--accent);
-            border-color: var(--accent);
-        }
-
-        .stats {
-            display: flex;
-            gap: 14px;
-            margin-top: 24px;
-            flex-wrap: wrap;
-        }
-
-        .stat {
-            border: 1px solid var(--hairline);
-            padding: 14px 18px;
-            min-width: 140px;
-            flex: 1;
-        }
-
-        .stat-label {
-            font-size: 10px;
-            letter-spacing: 2px;
-            color: var(--muted);
-            text-transform: uppercase;
-        }
-
-        .stat-value {
-            font-family: 'Space Grotesk', sans-serif;
-            font-size: 22px;
-            font-weight: 700;
-            color: var(--paper);
-            margin-top: 6px;
-        }
-
-        /* split-flap style digit counter for total passes */
-        .flap-row {
-            display: flex;
-            gap: 4px;
-            margin-top: 8px;
-        }
-
-        .flap-digit {
-            position: relative;
-            width: 26px;
-            height: 34px;
-            background: var(--bg);
-            border: 1px solid var(--hairline);
-            border-radius: 2px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 20px;
-            font-weight: 700;
-            color: var(--accent);
-            overflow: hidden;
-        }
-
-        .flap-digit::after {
-            content: '';
-            position: absolute;
-            left: 0; right: 0; top: 50%;
-            height: 1px;
-            background: var(--hairline);
-        }
-
-        .node-pill {
-            display: inline-block;
-            padding: 3px 10px;
-            border: 1px solid var(--hairline);
-            font-size: 12px;
-            letter-spacing: 0.5px;
-            color: var(--paper);
-        }
-
-        .table-scroll { overflow-x: auto; }
-
-        table { width: 100%; border-collapse: collapse; min-width: 480px; }
-
-        thead th {
-            text-align: left;
-            font-size: 11px;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            color: var(--muted);
-            font-weight: 500;
-            padding: 10px 12px;
-            border-bottom: 1px solid var(--hairline);
-            white-space: nowrap;
-        }
-
-        tbody td {
-            padding: 12px;
-            font-size: 13px;
-            border-bottom: 1px solid var(--hairline);
-            white-space: nowrap;
-        }
-
-        tbody tr:hover { background: rgba(255,255,255,0.02); }
-
-        tbody tr:first-child td { border-left: 2px solid var(--accent); }
-        tbody tr:first-child td:first-child { padding-left: 10px; }
-        tbody tr td:first-child { border-left: 2px solid transparent; }
-
-        .idx { color: var(--muted); width: 32px; }
-
-        .empty {
-            padding: 44px 14px;
-            text-align: center;
-            color: var(--muted);
-            letter-spacing: 1px;
-            font-size: 12px;
-            border: 1px dashed var(--hairline);
-        }
-
-        .debug-tab {
-            position: fixed;
-            top: 50%;
-            right: 0;
-            transform: translateY(-50%);
-            writing-mode: vertical-rl;
-            background: var(--panel);
-            border: 1px solid var(--hairline);
-            border-right: none;
-            color: var(--muted);
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            padding: 14px 8px;
-            cursor: pointer;
-            z-index: 30;
-        }
-
-        .debug-tab:hover { color: var(--accent); border-color: var(--accent); }
-
-        .debug-panel {
-            position: fixed;
-            top: 0;
-            right: 0;
-            bottom: 0;
-            width: 340px;
-            max-width: 90vw;
-            background: var(--panel);
-            border-left: 1px solid var(--hairline);
-            transform: translateX(100%);
-            transition: transform 0.25s ease;
-            z-index: 40;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .debug-panel.open { transform: translateX(0); }
-
-        .debug-header {
-            padding: 18px 18px 14px;
-            border-bottom: 1px solid var(--hairline);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .debug-header .eyebrow { margin: 0; }
-
-        .debug-close {
-            background: none;
-            border: 1px solid var(--hairline);
-            color: var(--muted);
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-            padding: 4px 9px;
-            cursor: pointer;
-        }
-
-        .debug-close:hover { color: var(--accent); border-color: var(--accent); }
-
-        .debug-filter {
-            padding: 12px 18px;
-            border-bottom: 1px solid var(--hairline);
-            display: flex;
-            gap: 8px;
-        }
-
-        .debug-filter select {
-            flex: 1;
-            min-width: 0;
-            background: var(--bg);
-            color: var(--paper);
-            border: 1px solid var(--hairline);
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 12px;
-            padding: 7px 8px;
-        }
-
-        .debug-filter select:focus { outline: none; border-color: var(--accent); }
-
-        .debug-section {
-            padding: 14px 18px;
-            border-bottom: 1px solid var(--hairline);
-            overflow-y: auto;
-        }
-
-        .debug-section-label {
-            font-size: 10px;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            color: var(--muted);
-            margin-bottom: 10px;
-        }
-
-        .debug-node-row {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-            padding: 6px 0;
-            font-size: 12px;
-        }
-
-        .debug-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            flex-shrink: 0;
-        }
-
-        .debug-dot.online { background: #7fc93f; box-shadow: 0 0 5px #7fc93f; }
-        .debug-dot.offline { background: #e04f4f; box-shadow: 0 0 5px #e04f4f; }
-
-        .debug-node-id { flex: 1; }
-
-        .debug-node-meta { color: var(--muted); font-size: 11px; }
-
-        .debug-drone-rssi {
-            width: 100%;
-            margin-top: 3px;
-            font-size: 11px;
-            color: var(--accent);
-        }
-
-        .debug-drop-info {
-            width: 100%;
-            margin-top: 3px;
-            font-size: 11px;
-            color: #ff6f59;
-        }
-
-        .fw-badge {
-            display: inline-block;
-            font-size: 9px;
-            letter-spacing: 0.5px;
-            color: var(--muted);
-            border: 1px solid var(--hairline);
-            padding: 1px 5px;
-            border-radius: 2px;
-        }
-
-        .fw-badge.fw-unknown {
-            color: #ff6f59;
-            border-color: #ff6f59;
-        }
-
-        .closest-badge {
-            display: inline-block;
-            font-size: 9px;
-            letter-spacing: 1px;
-            font-weight: 700;
-            color: #08130c;
-            background: var(--accent);
-            padding: 1px 5px;
-            margin-left: 4px;
-            border-radius: 2px;
-        }
-
-        .debug-log {
-            flex: 1;
-            overflow-y: auto;
-            padding: 10px 18px;
-            font-size: 11px;
-        }
-
-        .debug-log-row {
-            padding: 7px 0;
-            border-bottom: 1px solid var(--hairline);
-            line-height: 1.5;
-        }
-
-        .debug-log-time { color: var(--muted); }
-
-        .debug-log-kind {
-            display: inline-block;
-            padding: 1px 6px;
-            margin-left: 6px;
-            font-size: 10px;
-            letter-spacing: 0.5px;
-            text-transform: uppercase;
-            border: 1px solid var(--hairline);
-        }
-
-        .debug-log-kind.checkpoint { color: var(--accent); border-color: var(--accent); }
-        .debug-log-kind.heartbeat { color: #3fb3c9; border-color: #3fb3c9; }
-
-        .debug-empty {
-            color: var(--muted);
-            font-size: 12px;
-            padding: 8px 0;
-        }
+    :root {
+        --bg-main: #0b0f19;
+        --bg-card: #111827;
+        --bg-input: #1f2937;
+        --border-color: #1f2937;
+        --border-focus: #3b82f6;
+        --text-primary: #f9fafb;
+        --text-secondary: #9ca3af;
+        --text-muted: #6b7280;
+        
+        --accent-green: #10b981;
+        --accent-green-bg: rgba(16, 185, 129, 0.12);
+        --accent-blue: #3b82f6;
+        --accent-blue-bg: rgba(59, 130, 246, 0.12);
+        --accent-amber: #f59e0b;
+        --accent-amber-bg: rgba(245, 158, 11, 0.12);
+        --accent-red: #ef4444;
+        --accent-red-bg: rgba(239, 68, 68, 0.12);
+
+        --radius-sm: 6px;
+        --radius-md: 10px;
+        --radius-lg: 14px;
+        --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+        --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+        font-family: var(--font-sans);
+        background-color: var(--bg-main);
+        color: var(--text-primary);
+        line-height: 1.5;
+        padding: 24px 20px 60px;
+        min-height: 100vh;
+    }
+
+    .container {
+        max-width: 1080px;
+        margin: 0 auto;
+    }
+
+    .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 24px;
+        padding-bottom: 16px;
+        border-bottom: 1px solid var(--border-color);
+        flex-wrap: wrap;
+        gap: 16px;
+    }
+
+    .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+        color: var(--text-primary);
+    }
+
+    .brand-mark {
+        width: 28px;
+        height: 28px;
+        color: var(--accent-green);
+    }
+
+    .brand-title {
+        font-weight: 700;
+        font-size: 18px;
+        letter-spacing: -0.3px;
+    }
+
+    .brand-sub {
+        font-weight: 400;
+        color: var(--text-secondary);
+        font-size: 14px;
+        margin-left: 4px;
+    }
+
+    .brand-version {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text-muted);
+        background: var(--bg-input);
+        padding: 2px 6px;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-color);
+    }
+
+    .nav {
+        display: flex;
+        gap: 8px;
+    }
+
+    .nav-item {
+        text-decoration: none;
+        color: var(--text-secondary);
+        font-size: 13px;
+        font-weight: 500;
+        padding: 8px 14px;
+        border-radius: var(--radius-sm);
+        transition: all 0.15s ease;
+        border: 1px solid transparent;
+    }
+
+    .nav-item:hover {
+        color: var(--text-primary);
+        background: var(--bg-card);
+    }
+
+    .nav-item.active {
+        color: var(--accent-green);
+        background: var(--accent-green-bg);
+        border-color: rgba(16, 185, 129, 0.3);
+    }
+
+    .card {
+        background: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-md);
+        padding: 20px 24px;
+        margin-bottom: 20px;
+    }
+
+    .card-title {
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--text-primary);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 4px;
+    }
+
+    .card-subtitle {
+        font-size: 13px;
+        color: var(--text-secondary);
+        margin-bottom: 16px;
+    }
+
+    .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        font-family: var(--font-sans);
+        font-size: 13px;
+        font-weight: 600;
+        padding: 9px 18px;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-color);
+        background: var(--bg-input);
+        color: var(--text-primary);
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .btn:hover {
+        border-color: var(--text-muted);
+        background: #273548;
+    }
+
+    .btn-success {
+        background: var(--accent-green);
+        border-color: var(--accent-green);
+        color: #042f1a;
+    }
+    .btn-success:hover { background: #059669; border-color: #059669; color: #fff; }
+
+    .btn-danger {
+        background: var(--accent-red);
+        border-color: var(--accent-red);
+        color: #ffffff;
+    }
+    .btn-danger:hover { background: #dc2626; border-color: #dc2626; }
+
+    .btn-warning {
+        background: var(--accent-amber);
+        border-color: var(--accent-amber);
+        color: #451a03;
+    }
+
+    .btn-sm {
+        padding: 5px 10px;
+        font-size: 12px;
+    }
+
+    .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 4px 10px;
+        border-radius: 9999px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .badge-stopped {
+        background: var(--bg-input);
+        color: var(--text-secondary);
+        border: 1px solid var(--border-color);
+    }
+
+    .badge-running {
+        background: var(--accent-green-bg);
+        color: var(--accent-green);
+        border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+
+    .badge-finished {
+        background: var(--accent-blue-bg);
+        color: var(--accent-blue);
+        border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+
+    .badge-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: currentColor;
+    }
+
+    .badge-running .badge-dot {
+        animation: pulse 1.5s infinite;
+    }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+    }
+
+    .table-responsive {
+        width: 100%;
+        overflow-x: auto;
+    }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        text-align: left;
+        font-size: 13px;
+    }
+
+    th {
+        font-weight: 600;
+        color: var(--text-secondary);
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--border-color);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    td {
+        padding: 12px;
+        border-bottom: 1px solid var(--border-color);
+        color: var(--text-primary);
+    }
+
+    tr:last-child td {
+        border-bottom: none;
+    }
+
+    .font-mono {
+        font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
+    }
+
+    .form-group {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+
+    .form-label {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-secondary);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .form-control {
+        background: var(--bg-input);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        padding: 8px 12px;
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        font-size: 14px;
+    }
+
+    .form-control:focus {
+        outline: none;
+        border-color: var(--border-focus);
+    }
+
+    /* Telemetry Debug Drawer */
+    .debug-drawer {
+        position: fixed;
+        top: 0; right: 0; bottom: 0;
+        width: 420px;
+        max-width: 90vw;
+        background: var(--bg-card);
+        border-left: 1px solid var(--border-color);
+        transform: translateX(100%);
+        transition: transform 0.25s ease-in-out;
+        z-index: 100;
+        display: flex;
+        flex-direction: column;
+        box-shadow: -4px 0 24px rgba(0,0,0,0.5);
+    }
+
+    .debug-drawer.open {
+        transform: translateX(0);
+    }
+
+    .debug-toggle-btn {
+        position: fixed;
+        bottom: 20px; right: 20px;
+        z-index: 90;
+        border-radius: 9999px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+
+    .debug-sec-header {
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        color: var(--text-secondary);
+        margin-bottom: 8px;
+    }
+
+    .debug-dot {
+        display: inline-block;
+        width: 8px; height: 8px;
+        border-radius: 50%;
+        margin-right: 6px;
+    }
+    .debug-dot.online { background: var(--accent-green); box-shadow: 0 0 6px var(--accent-green); }
+    .debug-dot.offline { background: var(--accent-red); box-shadow: 0 0 6px var(--accent-red); }
+
+    .fw-tag {
+        display: inline-block;
+        font-family: var(--font-mono);
+        font-size: 10px;
+        padding: 1px 5px;
+        border-radius: 3px;
+        border: 1px solid var(--border-color);
+        color: var(--text-secondary);
+        margin-left: 6px;
+    }
+
+    .closest-tag {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 700;
+        color: #042f1a;
+        background: var(--accent-green);
+        padding: 1px 5px;
+        border-radius: 3px;
+        margin-left: 6px;
+    }
+
+    .log-kind-tag {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        padding: 1px 5px;
+        border-radius: 3px;
+        text-transform: uppercase;
+        margin-left: 6px;
+        font-weight: 600;
+    }
+    .log-kind-tag.checkpoint { background: var(--accent-green-bg); color: var(--accent-green); border: 1px solid rgba(16,185,129,0.3); }
+    .log-kind-tag.heartbeat { background: var(--accent-blue-bg); color: var(--accent-blue); border: 1px solid rgba(59,130,246,0.3); }
+
+    /* Node Network Grid Banner */
+    .nodes-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+        margin-bottom: 20px;
+    }
+
+    .node-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .node-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .node-card-id {
+        font-weight: 700;
+        font-size: 13px;
+    }
+
+    .node-card-sub {
+        font-size: 11px;
+        color: var(--text-secondary);
+        font-family: var(--font-mono);
+    }
 """
 
-DEBUG_PANEL_HTML = """
-    <div class="debug-tab" onclick="document.getElementById('debugPanel').classList.add('open')">Debug</div>
-    <div class="debug-panel" id="debugPanel">
-        <div class="debug-header">
-            <div class="eyebrow">Node connectivity</div>
-            <button class="debug-close" onclick="document.getElementById('debugPanel').classList.remove('open')">Close</button>
+DEBUG_DRAWER_HTML = """
+    <button class="btn btn-sm debug-toggle-btn" onclick="document.getElementById('debugDrawer').classList.toggle('open')">
+        Telemetry Debug
+    </button>
+
+    <div class="debug-drawer" id="debugDrawer">
+        <div style="padding: 16px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+            <h3 style="font-size: 14px; font-weight: 600;">Hardware Telemetry</h3>
+            <button class="btn btn-sm" onclick="document.getElementById('debugDrawer').classList.remove('open')">Close</button>
         </div>
-        <div class="debug-section" id="debugDrones">
-            <div class="debug-section-label">Drones</div>
-        </div>
-        <div class="debug-filter">
-            <select id="debugNodeFilter" onchange="debugTick()">
-                <option value="__all__">All checkpoints</option>
+
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border-color); display: flex; gap: 8px;">
+            <select id="debugNodeFilter" onchange="debugTick()" class="form-control" style="flex:1; font-size:12px;">
+                <option value="__all__">All Checkpoint Nodes</option>
             </select>
-            <select id="debugSortMode" onchange="debugTick()">
-                <option value="proximity">Sort: closest first</option>
-                <option value="node_id">Sort: node ID</option>
+            <select id="debugSortMode" onchange="debugTick()" class="form-control" style="flex:1; font-size:12px;">
+                <option value="proximity">Sort: Closest First</option>
+                <option value="node_id">Sort: Node ID</option>
             </select>
         </div>
-        <div class="debug-section" id="debugNodes">
-            <div class="debug-section-label">Nodes</div>
+
+        <div style="flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 18px;">
+            <!-- Drones Section -->
+            <div>
+                <div class="debug-sec-header" id="debugDronesHeader">Drones</div>
+                <div id="debugDronesList" style="display: flex; flex-direction: column; gap: 6px;"></div>
+            </div>
+
+            <!-- Nodes Section -->
+            <div>
+                <div class="debug-sec-header">Checkpoint Nodes</div>
+                <div id="debugNodesList" style="display: flex; flex-direction: column; gap: 10px;"></div>
+            </div>
+
+            <!-- Raw Log Section -->
+            <div>
+                <div class="debug-sec-header">Raw Request Log</div>
+                <div id="debugLogList" style="font-family: var(--font-mono); font-size: 11px; display: flex; flex-direction: column; gap: 8px;"></div>
+            </div>
         </div>
-        <div class="debug-section-label" style="padding: 12px 18px 0;">Raw request log</div>
-        <div class="debug-log" id="debugLog"></div>
     </div>
+
     <script>
-        // Sub-second polling: fetches are cheap in-memory reads on the Pi,
-        // and this guard skips a tick if the previous fetch hasn't landed
-        // yet so a slow network hiccup can't pile up overlapping requests.
-        const DEBUG_POLL_MS = 150;
         let debugTickInFlight = false;
 
-        function formatAge(ageSeconds) {
-            const ms = ageSeconds * 1000;
-            if (ms < 1000) return Math.round(ms) + 'ms ago';
-            return ageSeconds.toFixed(2) + 's ago';
-        }
-
-        function formatMs(ms) {
-            if (ms < 1000) return Math.round(ms) + 'ms ago';
-            return (ms / 1000).toFixed(1) + 's ago';
+        function formatAgeSec(sec) {
+            if (sec < 1) return Math.round(sec * 1000) + 'ms ago';
+            return sec.toFixed(1) + 's ago';
         }
 
         async function debugTick() {
             if (debugTickInFlight) return;
             debugTickInFlight = true;
 
-            let data;
             try {
                 const res = await fetch('/api/debug');
-                data = await res.json();
-            } catch (e) {
-                debugTickInFlight = false;
-                return;
-            }
+                const data = await res.json();
 
-            const dronesEl = document.getElementById('debugDrones');
-            const droneList = data.drones || [];
-            const onlineCount = droneList.filter(d => d.online).length;
-            dronesEl.innerHTML = '<div class="debug-section-label">Drones &middot; ' +
-                onlineCount + '/' + droneList.length + ' online</div>';
+                // 1. Drones Section
+                const drones = data.drones || [];
+                const onlineDrones = drones.filter(d => d.online).length;
+                document.getElementById('debugDronesHeader').textContent = `Drones · ${onlineDrones}/${drones.length} Online`;
 
-            if (droneList.length === 0) {
-                dronesEl.innerHTML += '<div class="debug-empty">No drones detected yet. Power one on within range of a checkpoint.</div>';
-            }
-            droneList.forEach(d => {
-                const row = document.createElement('div');
-                row.className = 'debug-node-row';
-                const detail = d.online
-                    ? '<span class="debug-node-meta">@ ' + d.closest_node + ' &middot; ' + d.rssi + ' dBm</span>'
-                    : '<span class="debug-node-meta">no beacon heard</span>';
-                row.innerHTML =
-                    '<span class="debug-dot ' + (d.online ? 'online' : 'offline') + '"></span>' +
-                    '<span class="debug-node-id" style="color:' + d.color + '">Drone ' + d.id + '</span>' +
-                    detail;
-                dronesEl.appendChild(row);
-            });
-
-            const filterEl = document.getElementById('debugNodeFilter');
-            const selected = filterEl.value || '__all__';
-            const knownIds = data.nodes.map(n => n.node_id);
-            const optionIds = Array.from(filterEl.options).map(o => o.value);
-            if (optionIds.length !== knownIds.length + 1 || knownIds.some(id => !optionIds.includes(id))) {
-                filterEl.innerHTML = '<option value="__all__">All checkpoints</option>' +
-                    knownIds.map(id => '<option value="' + id + '">' + id + '</option>').join('');
-                filterEl.value = optionIds.includes(selected) || selected === '__all__' ? selected : '__all__';
-            }
-            const activeFilter = filterEl.value || '__all__';
-            const sortMode = document.getElementById('debugSortMode').value || 'proximity';
-
-            let visibleNodes = activeFilter === '__all__'
-                ? data.nodes.slice()
-                : data.nodes.filter(n => n.node_id === activeFilter);
-
-            if (sortMode === 'proximity') {
-                visibleNodes.sort((a, b) => {
-                    const aLive = a.drone_age_ms !== null && a.drone_age_ms <= 3000;
-                    const bLive = b.drone_age_ms !== null && b.drone_age_ms <= 3000;
-                    if (aLive && bLive) return b.drone_rssi - a.drone_rssi;
-                    if (aLive) return -1;
-                    if (bLive) return 1;
-                    return a.node_id.localeCompare(b.node_id);
-                });
-            } else {
-                visibleNodes.sort((a, b) => a.node_id.localeCompare(b.node_id));
-            }
-
-            const nodesEl = document.getElementById('debugNodes');
-            nodesEl.innerHTML = '<div class="debug-section-label">Nodes</div>';
-            if (visibleNodes.length === 0) {
-                nodesEl.innerHTML += '<div class="debug-empty">No nodes have contacted the server yet.</div>';
-            }
-            visibleNodes.forEach(n => {
-                const row = document.createElement('div');
-                row.className = 'debug-node-row';
-                const heard = n.drones_heard || [];
-                const droneInfo = heard.length
-                    ? '<span class="debug-drone-rssi">' + heard.map(h =>
-                        'Drone ' + h.id + ' &middot; ' + h.rssi + ' dBm' +
-                        (h.is_closest ? ' <span class="closest-badge">CLOSEST</span>' : '')
-                      ).join('<br>') + '</span>'
-                    : '';
-                const fwBadge = n.fw_version
-                    ? '<span class="fw-badge">fw ' + n.fw_version + '</span>'
-                    : '<span class="fw-badge fw-unknown">fw ?</span>';
-                const dropInfo = (n.disconnect_count)
-                    ? '<span class="debug-drop-info">dropped ' + n.disconnect_count + '&times;' +
-                      (n.last_disc_label ? ' &middot; last: ' + n.last_disc_label : '') + '</span>'
-                    : '';
-                row.innerHTML =
-                    '<span class="debug-dot ' + (n.online ? 'online' : 'offline') + '"></span>' +
-                    '<span class="debug-node-id">' + n.node_id + '</span>' +
-                    fwBadge +
-                    '<span class="debug-node-meta">' + formatAge(n.age) + ' &middot; ' + n.ip + '</span>' +
-                    droneInfo +
-                    dropInfo;
-                nodesEl.appendChild(row);
-            });
-
-            const visibleLog = activeFilter === '__all__'
-                ? data.log
-                : data.log.filter(e => e.node_id === activeFilter);
-
-            const logEl = document.getElementById('debugLog');
-            logEl.innerHTML = '';
-            if (visibleLog.length === 0) {
-                logEl.innerHTML = '<div class="debug-empty">No requests logged yet.</div>';
-            }
-            visibleLog.slice(0, 60).forEach(e => {
-                const row = document.createElement('div');
-                row.className = 'debug-log-row';
-                let detail = '';
-                if (e.kind === 'checkpoint') {
-                    detail = 'drone ' + e.detail.drone_id + ' &middot; ' + e.detail.rssi + ' dBm';
-                } else if (e.kind === 'heartbeat') {
-                    detail = e.detail.wifi_rssi !== null && e.detail.wifi_rssi !== undefined
-                        ? 'wifi ' + e.detail.wifi_rssi + ' dBm' : '';
-                    if (e.detail.drone_rssi !== null && e.detail.drone_rssi !== undefined) {
-                        detail += ' &middot; drone ' + e.detail.drone_rssi + ' dBm';
-                    }
+                const dronesListEl = document.getElementById('debugDronesList');
+                if (drones.length === 0) {
+                    dronesListEl.innerHTML = `<div style="color: var(--text-muted); font-size: 12px;">No drone beacons heard yet.</div>`;
+                } else {
+                    dronesListEl.innerHTML = drones.map(d => `
+                        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; background: var(--bg-input); padding: 6px 10px; border-radius: 4px;">
+                            <div>
+                                <span class="debug-dot ${d.online ? 'online' : 'offline'}"></span>
+                                <strong style="color: ${d.color}">Drone ${d.id}</strong>
+                            </div>
+                            <span style="color: var(--text-secondary); font-size: 11px;">
+                                ${d.online ? `@ ${d.closest_node} &middot; ${d.rssi} dBm` : 'offline'}
+                            </span>
+                        </div>
+                    `).join('');
                 }
-                row.innerHTML =
-                    '<span class="debug-log-time">' + e.time_str + '</span>' +
-                    '<span class="debug-log-kind ' + e.kind + '">' + e.kind + '</span><br>' +
-                    '<strong>' + e.node_id + '</strong> ' + detail;
-                logEl.appendChild(row);
-            });
 
-            debugTickInFlight = false;
+                // 2. Node Filter Options Update
+                const filterEl = document.getElementById('debugNodeFilter');
+                const selectedFilter = filterEl.value || '__all__';
+                const knownNodeIds = (data.nodes || []).map(n => n.node_id);
+                const currentOptIds = Array.from(filterEl.options).map(o => o.value);
+
+                if (currentOptIds.length !== knownNodeIds.length + 1) {
+                    filterEl.innerHTML = '<option value="__all__">All Checkpoint Nodes</option>' +
+                        knownNodeIds.map(id => `<option value="${id}">${id}</option>`).join('');
+                    filterEl.value = currentOptIds.includes(selectedFilter) ? selectedFilter : '__all__';
+                }
+
+                const activeFilter = filterEl.value || '__all__';
+                const sortMode = document.getElementById('debugSortMode').value || 'proximity';
+
+                // 3. Visible Nodes & Sorting
+                let visibleNodes = activeFilter === '__all__'
+                    ? (data.nodes || []).slice()
+                    : (data.nodes || []).filter(n => n.node_id === activeFilter);
+
+                if (sortMode === 'proximity') {
+                    visibleNodes.sort((a, b) => {
+                        const aLive = a.drone_age_ms !== null && a.drone_age_ms <= 3000;
+                        const bLive = b.drone_age_ms !== null && b.drone_age_ms <= 3000;
+                        if (aLive && bLive) return b.drone_rssi - a.drone_rssi;
+                        if (aLive) return -1;
+                        if (bLive) return 1;
+                        return a.node_id.localeCompare(b.node_id);
+                    });
+                } else {
+                    visibleNodes.sort((a, b) => a.node_id.localeCompare(b.node_id));
+                }
+
+                const nodesListEl = document.getElementById('debugNodesList');
+                if (visibleNodes.length === 0) {
+                    nodesListEl.innerHTML = `<div style="color: var(--text-muted); font-size: 12px;">No nodes connected.</div>`;
+                } else {
+                    nodesListEl.innerHTML = visibleNodes.map(n => {
+                        const heard = n.drones_heard || [];
+                        const dronesInfo = heard.length > 0 ? heard.map(h =>
+                            `Drone ${h.id} &middot; ${h.rssi} dBm${h.is_closest ? ' <span class="closest-tag">CLOSEST</span>' : ''}`
+                        ).join('<br>') : '';
+
+                        const fwBadge = n.fw_version
+                            ? `<span class="fw-tag">fw ${n.fw_version}</span>`
+                            : `<span class="fw-tag" style="color: var(--accent-red)">fw ?</span>`;
+
+                        const dropInfo = n.disconnect_count ? `
+                            <div style="color: var(--accent-amber); font-size: 11px; margin-top: 2px;">
+                                Dropped ${n.disconnect_count}x ${n.last_disc_label ? '&middot; last: ' + n.last_disc_label : ''}
+                            </div>
+                        ` : '';
+
+                        return `
+                            <div style="background: var(--bg-input); padding: 8px 10px; border-radius: 4px; font-size: 12px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center;">
+                                    <div>
+                                        <span class="debug-dot ${n.online ? 'online' : 'offline'}"></span>
+                                        <strong>${n.node_id}</strong>
+                                        ${fwBadge}
+                                    </div>
+                                    <span style="color: var(--text-secondary); font-size: 11px;">${formatAgeSec(n.age)} &middot; ${n.ip}</span>
+                                </div>
+                                ${dronesInfo ? `<div style="color: var(--accent-green); font-size: 11px; margin-top: 4px;">${dronesInfo}</div>` : ''}
+                                ${dropInfo}
+                            </div>
+                        `;
+                    }).join('');
+                }
+
+                // 4. Raw Log Stream
+                const visibleLogs = activeFilter === '__all__'
+                    ? (data.log || [])
+                    : (data.log || []).filter(l => l.node_id === activeFilter);
+
+                const logListEl = document.getElementById('debugLogList');
+                if (visibleLogs.length === 0) {
+                    logListEl.innerHTML = `<div style="color: var(--text-muted); font-size: 12px;">No request logs recorded.</div>`;
+                } else {
+                    logListEl.innerHTML = visibleLogs.slice(0, 40).map(l => {
+                        let detailStr = '';
+                        if (l.kind === 'checkpoint') {
+                            detailStr = `drone ${l.detail.drone_id} &middot; ${l.detail.rssi} dBm`;
+                        } else if (l.kind === 'heartbeat') {
+                            detailStr = l.detail.wifi_rssi !== undefined && l.detail.wifi_rssi !== null
+                                ? `wifi ${l.detail.wifi_rssi} dBm` : '';
+                            if (l.detail.drone_rssi !== undefined && l.detail.drone_rssi !== null) {
+                                detailStr += ` &middot; drone ${l.detail.drone_rssi} dBm`;
+                            }
+                        }
+                        return `
+                            <div style="border-bottom: 1px solid var(--border-color); padding-bottom: 4px;">
+                                <span style="color: var(--text-muted);">${l.time_str}</span>
+                                <span class="log-kind-tag ${l.kind}">${l.kind}</span><br>
+                                <strong style="color: var(--text-primary);">${l.node_id}</strong>
+                                <span style="color: var(--text-secondary);">${detailStr}</span>
+                            </div>
+                        `;
+                    }).join('');
+                }
+            } catch (e) {
+            } finally {
+                debugTickInFlight = false;
+            }
         }
 
+        setInterval(debugTick, 250);
         debugTick();
-        setInterval(debugTick, DEBUG_POLL_MS);
     </script>
 """
 
-LEADERBOARD_PAGE = """
+# -----------------------------------------------------------------------------
+# Main Race Control Page
+# -----------------------------------------------------------------------------
+
+RACE_CONTROL_PAGE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>kwad — Live Track</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta charset="UTF-8">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>kwad — Race Control</title>
     <style>
-""" + BASE_STYLE + """
+    """ + BASE_STYLE + """
+        .race-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .race-clock-display {
+            font-family: var(--font-mono);
+            font-size: 42px;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -1px;
+            line-height: 1;
+        }
+
+        .controls-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .gate-sequence-pills {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+
+        .gate-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-color);
+            padding: 4px 10px;
+            border-radius: var(--radius-sm);
+            font-family: var(--font-mono);
+            font-size: 12px;
+        }
+
+        .gate-arrow {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        .log-stream {
+            max-height: 220px;
+            overflow-y: auto;
+            font-family: var(--font-mono);
+            font-size: 12px;
+        }
+
+        .log-row {
+            padding: 6px 0;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            gap: 12px;
+            align-items: baseline;
+        }
+
+        .log-time { color: var(--text-muted); min-width: 80px; }
+        .log-valid { color: var(--accent-green); }
+        .log-invalid { color: var(--accent-red); font-weight: 600; }
+
+        .tab-bar {
+            display: flex;
+            gap: 12px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 16px;
+        }
+
+        .tab-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 13px;
+            font-weight: 600;
+            padding: 8px 12px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+        }
+
+        .tab-btn.active {
+            color: var(--accent-green);
+            border-bottom-color: var(--accent-green);
+        }
     </style>
 </head>
 <body>
-    {{ topbar_html|safe }}
-    <div class="wrap">
-        <div class="panel">
-            <div class="eyebrow">Checkpoint telemetry</div>
-            <div class="title-row">
-                <h1>Live Track</h1>
-                <span class="live"><span class="live-dot"></span>Live</span>
-            </div>
-            <p class="subhead">Real-time checkpoint passes reported by race nodes, relayed to base over the timing network.</p>
+    <div class="container">
+        {{ topbar_html|safe }}
 
-            <div class="stats">
-                <div class="stat">
-                    <div class="stat-label">Total passes</div>
-                    <div class="flap-row" id="flapRow"></div>
+        <!-- Live Node Network Grid -->
+        <div class="nodes-grid" id="nodesBannerGrid">
+            <div style="color: var(--text-muted); font-size: 12px; grid-column: 1 / -1;">
+                Scanning for active checkpoint nodes...
+            </div>
+        </div>
+
+        <!-- Race Control Banner -->
+        <div class="card">
+            <div class="race-header">
+                <div>
+                    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 6px;">
+                        <span id="raceStatusBadge" class="badge badge-stopped">
+                            <span class="badge-dot"></span><span id="raceStatusText">STOPPED</span>
+                        </span>
+                        <span style="font-size: 13px; color: var(--text-secondary);" id="raceModeLabel">Practice / Free Fly</span>
+                    </div>
+                    <div class="race-clock-display" id="raceClock">00:00.0</div>
                 </div>
-                <div class="stat">
-                    <div class="stat-label">Last node</div>
-                    <div class="stat-value" id="lastNode">—</div>
+
+                <div class="controls-group">
+                    <button class="btn btn-success" id="startBtn" onclick="controlRace('start')">
+                        Start Race
+                    </button>
+                    <button class="btn btn-danger" id="stopBtn" onclick="controlRace('stop')">
+                        Stop
+                    </button>
+                    <button class="btn" id="resetBtn" onclick="controlRace('reset')">
+                        Reset Data
+                    </button>
                 </div>
-                <div class="stat">
-                    <div class="stat-label">Refresh interval</div>
-                    <div class="stat-value">Live</div>
+            </div>
+
+            <!-- Race Rules & Gate Config -->
+            <div class="config-grid">
+                <div class="form-group">
+                    <label class="form-label">Target Laps</label>
+                    <input type="number" id="targetLapsInput" class="form-control" min="1" max="100" value="3">
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Gate Order Enforcement</label>
+                    <select id="enforceGatesSelect" class="form-control">
+                        <option value="true">ENFORCED (Drones must hit gates in order)</option>
+                        <option value="false">DISABLED (Any gate pass counts)</option>
+                    </select>
+                </div>
+
+                <div class="form-group" style="grid-column: 1 / -1;">
+                    <label class="form-label">Gate Sequence Order (Comma separated Node IDs)</label>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="text" id="gateOrderInput" class="form-control" style="flex: 1;" placeholder="checkpoint-1, checkpoint-2, checkpoint-3">
+                        <button class="btn btn-sm" onclick="saveRaceConfig()">Update Config</button>
+                    </div>
+                    <div class="gate-sequence-pills" id="gateSequencePreview"></div>
                 </div>
             </div>
         </div>
 
-        <div class="panel">
-            <div class="table-scroll">
-                <table>
-                    <thead>
-                        <tr><th>#</th><th>Node</th><th>Drone</th><th>RSSI</th><th>Sent</th><th>Received &middot; Pi</th></tr>
-                    </thead>
-                    <tbody id="eventsBody"></tbody>
-                </table>
+        <!-- Standings / Leaderboard -->
+        <div class="card">
+            <div class="tab-bar">
+                <button class="tab-btn active" onclick="switchMainTab('standings', this)">Live Standings</button>
+                <button class="tab-btn" onclick="switchMainTab('rawEvents', this)">Raw Checkpoint Log (<span id="totalPassesCount">0</span>)</button>
             </div>
-            <div class="empty" id="emptyState" style="display:none;">Waiting for checkpoint signal &hellip;</div>
+
+            <div id="tabStandingsView">
+                <div class="table-responsive">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pos</th>
+                                <th>Drone</th>
+                                <th>Status</th>
+                                <th>Laps</th>
+                                <th>Next Required Gate</th>
+                                <th>Last Lap</th>
+                                <th>Best Lap</th>
+                                <th>Total Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="standingsBody">
+                            <tr><td colspan="8" style="color: var(--text-muted); text-align: center; padding: 24px;">No active drones detected. Power on a drone or fly through a gate.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="tabRawEventsView" style="display: none;">
+                <div class="table-responsive">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Node ID</th>
+                                <th>Drone ID</th>
+                                <th>RSSI</th>
+                                <th>Node Timestamp</th>
+                                <th>Received Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="rawEventsBody">
+                            <tr><td colspan="6" style="color: var(--text-muted); text-align: center; padding: 24px;">No pass events recorded yet.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Live Gate Pass Stream -->
+        <div class="card">
+            <div class="card-title">Live Gate Feed</div>
+            <div class="card-subtitle">Real-time gate pass verification, practice hits, and skipped gate alerts</div>
+
+            <div class="log-stream" id="logStream">
+                <div style="color: var(--text-muted); padding: 12px 0;">Waiting for gate passes...</div>
+            </div>
         </div>
     </div>
-""" + DEBUG_PANEL_HTML + """
-    <script>
-        const flapRowEl = document.getElementById('flapRow');
-        const lastNodeEl = document.getElementById('lastNode');
-        const bodyEl = document.getElementById('eventsBody');
-        const emptyEl = document.getElementById('emptyState');
 
-        function esc(s) {
-            return String(s).replace(/[&<>"']/g, c => ({
-                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-            }[c]));
+    """ + DEBUG_DRAWER_HTML + """
+
+    <script>
+        function switchMainTab(tabName, btnEl) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            btnEl.classList.add('active');
+
+            if (tabName === 'standings') {
+                document.getElementById('tabStandingsView').style.display = 'block';
+                document.getElementById('tabRawEventsView').style.display = 'none';
+            } else {
+                document.getElementById('tabStandingsView').style.display = 'none';
+                document.getElementById('tabRawEventsView').style.display = 'block';
+            }
         }
 
-        async function leaderboardTick() {
-            let data;
+        async function fetchRaceStatus() {
             try {
-                const res = await fetch('/api/leaderboard');
-                data = await res.json();
+                const res = await fetch('/api/race/status');
+                const data = await res.json();
+                renderRaceUI(data);
             } catch (e) {
-                return;
+                console.error("Failed to fetch race status", e);
+            }
+        }
+
+        function renderRaceUI(data) {
+            const state = data.race;
+            
+            // Status Badge & Mode Label
+            const badge = document.getElementById('raceStatusBadge');
+            const statusText = document.getElementById('raceStatusText');
+            const modeLabel = document.getElementById('raceModeLabel');
+            statusText.textContent = state.status;
+            
+            if (state.status === 'RUNNING') {
+                badge.className = 'badge badge-running';
+                modeLabel.textContent = "Timed Race Active";
+            } else if (state.status === 'FINISHED') {
+                badge.className = 'badge badge-finished';
+                modeLabel.textContent = "Race Finished";
+            } else {
+                badge.className = 'badge badge-stopped';
+                modeLabel.textContent = "Practice / Free Fly";
             }
 
-            const digits = String(data.count).padStart(3, '0').split('');
-            flapRowEl.innerHTML = digits.map(d => '<span class="flap-digit">' + d + '</span>').join('');
+            // Race Clock
+            if (state.status === 'RUNNING' && state.start_time) {
+                const elapsed = (Date.now() / 1000) - state.start_time;
+                document.getElementById('raceClock').textContent = formatSeconds(elapsed);
+            } else if (state.status === 'FINISHED' && state.start_time && state.end_time) {
+                document.getElementById('raceClock').textContent = formatSeconds(state.end_time - state.start_time);
+            } else if (state.status === 'STOPPED') {
+                document.getElementById('raceClock').textContent = "00:00.0";
+            }
 
-            lastNodeEl.textContent = data.events.length ? data.events[0].node_id : '—';
+            // Config inputs
+            if (document.activeElement !== document.getElementById('targetLapsInput')) {
+                document.getElementById('targetLapsInput').value = state.target_laps;
+            }
+            if (document.activeElement !== document.getElementById('enforceGatesSelect')) {
+                document.getElementById('enforceGatesSelect').value = state.enforce_gate_order ? 'true' : 'false';
+            }
+            if (document.activeElement !== document.getElementById('gateOrderInput')) {
+                document.getElementById('gateOrderInput').value = state.gate_order.join(', ');
+            }
 
-            emptyEl.style.display = data.events.length ? 'none' : 'block';
-            bodyEl.innerHTML = data.events.map((e, i) => (
-                '<tr>' +
-                '<td class="idx">' + String(i + 1).padStart(2, '0') + '</td>' +
-                '<td><span class="node-pill">' + esc(e.node_id) + '</span></td>' +
-                '<td>' + esc(e.drone_id) + '</td>' +
-                '<td>' + esc(e.rssi) + '</td>' +
-                '<td>' + esc(e.timestamp) + '</td>' +
-                '<td>' + esc(e.received_at) + '</td>' +
-                '</tr>'
-            )).join('');
+            // Gate sequence preview
+            const previewEl = document.getElementById('gateSequencePreview');
+            previewEl.innerHTML = state.gate_order.map((g, i) => `
+                <span class="gate-pill">Gate ${i+1}: ${g}</span>
+                ${i < state.gate_order.length - 1 ? '<span class="gate-arrow">&rarr;</span>' : ''}
+            `).join('');
+
+            // Connected Checkpoints Grid Banner
+            const nodesGridEl = document.getElementById('nodesBannerGrid');
+            const nodes = data.nodes || [];
+            if (nodes.length === 0) {
+                nodesGridEl.innerHTML = `<div style="color: var(--text-muted); font-size: 12px; grid-column: 1 / -1;">No checkpoint nodes connected yet. Power on an ESP32 node.</div>`;
+            } else {
+                nodesGridEl.innerHTML = nodes.map(n => `
+                    <div class="node-card">
+                        <div class="node-card-header">
+                            <span class="node-card-id">${n.node_id}</span>
+                            <span class="debug-dot ${n.online ? 'online' : 'offline'}"></span>
+                        </div>
+                        <div class="node-card-sub">
+                            ${n.online ? 'ONLINE · ' + n.ip : 'OFFLINE'}
+                        </div>
+                        ${n.wifi_rssi ? `<div style="font-size: 10px; color: var(--text-muted);">WiFi: ${n.wifi_rssi} dBm</div>` : ''}
+                    </div>
+                `).join('');
+            }
+
+            // Standings table
+            const standingsBody = document.getElementById('standingsBody');
+            const standings = data.standings || [];
+
+            if (standings.length === 0) {
+                standingsBody.innerHTML = `<tr><td colspan="8" style="color: var(--text-muted); text-align: center; padding: 24px;">No active drones detected yet. Fly through a gate or power on a drone.</td></tr>`;
+            } else {
+                standingsBody.innerHTML = standings.map((s, idx) => {
+                    const lastLap = s.laps.length > 0 ? s.laps[s.laps.length - 1].lap_time.toFixed(2) + 's' : '—';
+                    const bestLap = s.best_lap ? s.best_lap.toFixed(2) + 's' : '—';
+                    const totalTime = s.total_time ? s.total_time.toFixed(2) + 's' : '—';
+                    const nextGate = state.gate_order[s.next_gate_index] || '—';
+
+                    return `
+                        <tr>
+                            <td class="font-mono" style="font-weight:700;">#${idx + 1}</td>
+                            <td>
+                                <strong style="color: ${s.color};">Drone ${s.drone_id}</strong>
+                            </td>
+                            <td>
+                                <span class="badge ${s.status === 'FINISHED' ? 'badge-finished' : (s.status === 'RACING' ? 'badge-running' : 'badge-stopped')}">
+                                    ${s.status}
+                                </span>
+                            </td>
+                            <td class="font-mono"><strong>${s.completed_laps}</strong> / ${state.target_laps}</td>
+                            <td class="font-mono" style="color: var(--accent-blue);">${s.status === 'FINISHED' ? '—' : nextGate}</td>
+                            <td class="font-mono">${lastLap}</td>
+                            <td class="font-mono" style="color: var(--accent-green);">${bestLap}</td>
+                            <td class="font-mono">${totalTime}</td>
+                        </tr>
+                    `;
+                }).join('');
+            }
+
+            // Total passes count
+            document.getElementById('totalPassesCount').textContent = data.total_passes || 0;
+
+            // Raw Events Table
+            const rawBody = document.getElementById('rawEventsBody');
+            const rawEvents = data.events || [];
+            if (rawEvents.length === 0) {
+                rawBody.innerHTML = `<tr><td colspan="6" style="color: var(--text-muted); text-align: center; padding: 24px;">No pass events recorded yet.</td></tr>`;
+            } else {
+                rawBody.innerHTML = rawEvents.slice(0, 30).map((e, idx) => `
+                    <tr>
+                        <td class="font-mono" style="color: var(--text-muted);">${String(idx + 1).padStart(2, '0')}</td>
+                        <td><strong style="color: var(--text-primary);">${e.node_id}</strong></td>
+                        <td style="color: var(--accent-green);">Drone ${e.drone_id}</td>
+                        <td class="font-mono">${e.rssi} dBm</td>
+                        <td class="font-mono">${e.timestamp}</td>
+                        <td class="font-mono" style="color: var(--text-secondary);">${e.received_at}</td>
+                    </tr>
+                `).join('');
+            }
+
+            // Live Feed Log Stream
+            const logEl = document.getElementById('logStream');
+            const logs = data.logs || [];
+            if (logs.length === 0) {
+                logEl.innerHTML = `<div style="color: var(--text-muted); padding: 12px 0;">Waiting for gate passes...</div>`;
+            } else {
+                logEl.innerHTML = logs.map(l => `
+                    <div class="log-row">
+                        <span class="log-time">${l.time}</span>
+                        <span class="${l.valid ? 'log-valid' : 'log-invalid'}">${l.message}</span>
+                    </div>
+                `).join('');
+            }
         }
 
-        leaderboardTick();
-        setInterval(leaderboardTick, 1000);
+        function formatSeconds(sec) {
+            if (!sec || sec < 0) return "00:00.0";
+            const m = Math.floor(sec / 60);
+            const s = (sec % 60).toFixed(1);
+            return `${String(m).padStart(2, '0')}:${String(s).padStart(4, '0')}`;
+        }
+
+        async function controlRace(action) {
+            await fetch(`/api/race/${action}`, { method: 'POST' });
+            fetchRaceStatus();
+        }
+
+        async function saveRaceConfig() {
+            const targetLaps = parseInt(document.getElementById('targetLapsInput').value, 10);
+            const enforce = document.getElementById('enforceGatesSelect').value === 'true';
+            const rawOrder = document.getElementById('gateOrderInput').value;
+            const gateOrder = rawOrder.split(',').map(s => s.trim()).filter(Boolean);
+
+            await fetch('/api/race/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    target_laps: targetLaps,
+                    enforce_gate_order: enforce,
+                    gate_order: gateOrder
+                })
+            });
+            fetchRaceStatus();
+        }
+
+        setInterval(fetchRaceStatus, 500);
+        fetchRaceStatus();
     </script>
 </body>
 </html>
 """
 
+# -----------------------------------------------------------------------------
+# Radar & Settings Pages
+# -----------------------------------------------------------------------------
+
 RADAR_PAGE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>kwad — Radar</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta charset="UTF-8">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>kwad — Radar</title>
     <style>
-""" + BASE_STYLE + """
-        .radar-square {
+    """ + BASE_STYLE + """
+        .radar-box {
             position: relative;
             width: 100%;
             aspect-ratio: 1 / 1;
-            background:
-                linear-gradient(var(--hairline) 1px, transparent 1px) 0 0 / 10% 10%,
-                linear-gradient(90deg, var(--hairline) 1px, transparent 1px) 0 0 / 10% 10%,
-                var(--bg);
-            border: 1px solid var(--hairline);
+            background: var(--bg-input);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
             overflow: hidden;
         }
 
         .node-marker {
             position: absolute;
-            width: 14px;
-            height: 14px;
+            width: 16px;
+            height: 16px;
             transform: translate(-50%, -50%);
-            border: 1.5px solid var(--muted);
-            background: var(--panel);
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            border: 2px solid var(--accent-blue);
+            background: var(--bg-card);
+            border-radius: 4px;
         }
 
         .node-label {
             position: absolute;
-            transform: translate(-50%, 10px);
+            transform: translate(-50%, 12px);
             top: 100%;
-            font-size: 10px;
-            letter-spacing: 1px;
-            color: var(--muted);
+            font-size: 11px;
+            font-family: var(--font-mono);
+            color: var(--text-secondary);
             white-space: nowrap;
-            text-transform: uppercase;
         }
 
         .drone-marker {
             position: absolute;
-            width: 12px;
-            height: 12px;
+            width: 14px;
+            height: 14px;
             border-radius: 50%;
             transform: translate(-50%, -50%);
-            transition: left 0.4s ease, top 0.4s ease, opacity 0.4s ease;
+            transition: left 0.4s ease, top 0.4s ease;
         }
 
-        .drone-marker .ring {
+        .drone-label {
             position: absolute;
-            inset: -14px;
-            border-radius: 50%;
-            border: 1px solid currentColor;
-            opacity: 0.5;
-            animation: radar-ping 1.6s ease-out infinite;
-        }
-
-        @keyframes radar-ping {
-            0% { transform: scale(0.4); opacity: 0.6; }
-            100% { transform: scale(2.4); opacity: 0; }
-        }
-
-        .drone-tag {
-            position: absolute;
-            left: 16px;
-            top: -6px;
-            font-size: 10px;
-            letter-spacing: 1px;
-            white-space: nowrap;
+            left: 18px;
+            top: -4px;
+            font-size: 11px;
+            font-family: var(--font-mono);
             font-weight: 700;
-        }
-
-        .legend {
-            display: flex;
-            gap: 16px;
-            margin-top: 16px;
-            flex-wrap: wrap;
-        }
-
-        .legend-item {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 12px;
-            color: var(--muted);
-        }
-
-        .legend-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
+            white-space: nowrap;
         }
     </style>
 </head>
 <body>
-    {{ topbar_html|safe }}
-    <div class="wrap">
-        <div class="panel">
-            <div class="eyebrow">Proximity radar</div>
-            <div class="title-row">
-                <h1>Radar</h1>
-                <span class="live"><span class="live-dot"></span>Live</span>
-            </div>
-            <p class="subhead">Drones snap to the checkpoint that most recently detected them and fade out after a few seconds of silence. This reflects discrete pass events, not continuous position.</p>
-        </div>
-
-        <div class="panel">
-            <div class="radar-square" id="radar"></div>
-            <div class="legend" id="legend"></div>
+    <div class="container">
+        {{ topbar_html|safe }}
+        
+        <div class="card">
+            <div class="card-title">Track Proximity Radar</div>
+            <div class="card-subtitle">Visual positioning based on latest gate proximity reports</div>
+            <div class="radar-box" id="radarBox"></div>
         </div>
     </div>
 
-    <script>
-        const radarEl = document.getElementById('radar');
-        const legendEl = document.getElementById('legend');
+    """ + DEBUG_DRAWER_HTML + """
 
-        async function tick() {
-            let data;
+    <script>
+        async function updateRadar() {
             try {
                 const res = await fetch('/api/radar');
-                data = await res.json();
-            } catch (e) {
-                return;
-            }
+                const data = await res.json();
+                const box = document.getElementById('radarBox');
+                box.innerHTML = '';
 
-            radarEl.querySelectorAll('.node-marker, .node-label, .drone-marker').forEach(el => el.remove());
+                data.nodes.forEach(n => {
+                    const el = document.createElement('div');
+                    el.className = 'node-marker';
+                    el.style.left = n.x + '%';
+                    el.style.top = n.y + '%';
 
-            data.nodes.forEach(n => {
-                const marker = document.createElement('div');
-                marker.className = 'node-marker';
-                marker.style.left = n.x + '%';
-                marker.style.top = n.y + '%';
-                radarEl.appendChild(marker);
+                    const lbl = document.createElement('div');
+                    lbl.className = 'node-label';
+                    lbl.textContent = n.id;
+                    el.appendChild(lbl);
 
-                const label = document.createElement('div');
-                label.className = 'node-label';
-                label.style.left = n.x + '%';
-                label.style.top = n.y + '%';
-                label.textContent = n.id;
-                radarEl.appendChild(label);
-            });
+                    box.appendChild(el);
+                });
 
-            legendEl.innerHTML = '';
-            data.drones.forEach(d => {
-                const marker = document.createElement('div');
-                marker.className = 'drone-marker';
-                marker.style.left = d.x + '%';
-                marker.style.top = d.y + '%';
-                marker.style.color = d.color;
-                marker.style.background = d.color;
-                marker.style.opacity = d.opacity;
-                marker.style.boxShadow = '0 0 ' + (6 + d.strength * 10) + 'px ' + d.color;
+                data.drones.forEach(d => {
+                    const el = document.createElement('div');
+                    el.className = 'drone-marker';
+                    el.style.left = d.x + '%';
+                    el.style.top = d.y + '%';
+                    el.style.backgroundColor = d.color;
 
-                const ring = document.createElement('div');
-                ring.className = 'ring';
-                marker.appendChild(ring);
+                    const lbl = document.createElement('div');
+                    lbl.className = 'drone-label';
+                    lbl.style.color = d.color;
+                    lbl.textContent = 'DRONE ' + d.id;
+                    el.appendChild(lbl);
 
-                const tag = document.createElement('div');
-                tag.className = 'drone-tag';
-                tag.style.color = d.color;
-                tag.textContent = 'DRONE ' + d.id;
-                marker.appendChild(tag);
-
-                radarEl.appendChild(marker);
-
-                const item = document.createElement('div');
-                item.className = 'legend-item';
-                item.innerHTML = '<span class="legend-dot" style="background:' + d.color + '"></span>' +
-                    'Drone ' + d.id + ' &middot; last @ ' + d.last_node + ' &middot; ' + d.rssi + ' dBm &middot; ' + d.age.toFixed(1) + 's ago';
-                legendEl.appendChild(item);
-            });
-
-            if (data.drones.length === 0) {
-                legendEl.innerHTML = '<div class="legend-item">No drones detected yet.</div>';
-            }
+                    box.appendChild(el);
+                });
+            } catch (e) {}
         }
-
-        tick();
-        setInterval(tick, 400);
+        setInterval(updateRadar, 400);
+        updateRadar();
     </script>
-""" + DEBUG_PANEL_HTML + """
 </body>
 </html>
 """
 
 SETTINGS_PAGE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>kwad — Settings</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta charset="UTF-8">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>kwad — Gate Settings</title>
     <style>
-""" + BASE_STYLE + """
-        .settings-select-row {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-
-        .settings-select-row select {
-            flex: 1;
-            min-width: 200px;
-            background: var(--bg);
-            color: var(--paper);
-            border: 1px solid var(--hairline);
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 13px;
-            padding: 10px 12px;
-        }
-
-        .settings-select-row select:focus { outline: none; border-color: var(--accent); }
-
-        .btn {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 12px;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-            padding: 10px 16px;
-            border: 1px solid var(--hairline);
-            background: var(--panel);
-            color: var(--paper);
-            cursor: pointer;
-        }
-
-        .btn:hover { border-color: var(--accent); color: var(--accent); }
-
-        .btn-primary {
-            background: var(--accent);
-            border-color: var(--accent);
-            color: #08130c;
-            font-weight: 700;
-        }
-
-        .btn-primary:hover { color: #08130c; opacity: 0.9; }
-
-        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-        .field-grid {
+    """ + BASE_STYLE + """
+        .settings-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 18px;
-            margin-top: 22px;
-        }
-
-        .field label {
-            display: block;
-            font-size: 11px;
-            letter-spacing: 1.5px;
-            text-transform: uppercase;
-            color: var(--paper);
-            margin-bottom: 6px;
-        }
-
-        .field input {
-            width: 100%;
-            background: var(--bg);
-            color: var(--paper);
-            border: 1px solid var(--hairline);
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 14px;
-            padding: 9px 10px;
-        }
-
-        .field input:focus { outline: none; border-color: var(--accent); }
-
-        .field-hint {
-            margin-top: 5px;
-            font-size: 11px;
-            color: var(--muted);
-            line-height: 1.4;
-        }
-
-        .settings-actions {
-            display: flex;
-            gap: 10px;
-            margin-top: 24px;
-            align-items: center;
-        }
-
-        .settings-status {
-            font-size: 12px;
-            letter-spacing: 0.5px;
-        }
-
-        .settings-status.ok { color: var(--accent); }
-        .settings-status.err { color: #ff6f59; }
-
-        .override-badge {
-            font-size: 10px;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-            color: var(--accent);
-            border: 1px solid var(--accent);
-            padding: 2px 7px;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            margin-top: 16px;
         }
     </style>
 </head>
 <body>
-    {{ topbar_html|safe }}
-    <div class="wrap">
-        <div class="panel">
-            <div class="eyebrow">Checkpoint configuration</div>
-            <div class="title-row">
-                <h1>Settings</h1>
-            </div>
-            <p class="subhead">Gate-timing and heartbeat parameters per checkpoint. Boards fetch these from the Pi on boot and re-poll periodically, so changes here apply live without re-flashing &mdash; as long as the board is already running firmware that fetches settings.</p>
+    <div class="container">
+        {{ topbar_html|safe }}
 
-            <div class="settings-select-row" style="margin-top: 22px;">
-                <select id="nodeSelect"></select>
-                <span id="overrideBadge" class="override-badge" style="display:none;">Customized</span>
-                <button class="btn" id="resetBtn" type="button">Reset to defaults</button>
-            </div>
-        </div>
+        <div class="card">
+            <div class="card-title">Checkpoint Hardware Tuning</div>
+            <div class="card-subtitle">Configure gate-timing and RSSI thresholds per node</div>
 
-        <div class="panel">
+            <div style="display: flex; gap: 12px; margin-bottom: 20px;">
+                <select id="nodeSelect" class="form-control" style="flex:1;" onchange="loadNodeSettings()"></select>
+                <button class="btn btn-danger btn-sm" type="button" onclick="resetNodeSettings()">Reset Defaults</button>
+            </div>
+
             <form id="settingsForm">
-                <div class="field-grid" id="fieldGrid"></div>
-                <div class="settings-actions">
-                    <button class="btn btn-primary" type="submit">Save</button>
-                    <span class="settings-status" id="statusMsg"></span>
+                <div class="settings-grid" id="fieldsGrid"></div>
+                <div style="margin-top: 20px; display: flex; align-items: center; gap: 12px;">
+                    <button class="btn btn-success" type="submit">Save Hardware Settings</button>
+                    <span id="saveStatus" style="font-size: 13px;"></span>
                 </div>
             </form>
         </div>
     </div>
-""" + DEBUG_PANEL_HTML + """
+
+    """ + DEBUG_DRAWER_HTML + """
+
     <script>
-        const FIELD_META = [
-            { key: 'enter_rssi', label: 'Enter RSSI (dBm)', hint: 'Threshold to begin tracking a pass. Closer to 0 = drone must be closer.' },
-            { key: 'exit_rssi', label: 'Exit RSSI (dBm)', hint: 'Threshold considered outside the gate zone.' },
-            { key: 'required_weak_samples', label: 'Required weak samples', hint: 'Consecutive weak readings needed to close out a pass.' },
-            { key: 'pass_timeout_ms', label: 'Pass timeout (ms)', hint: 'Force-close a pass if the signal drops out completely.' },
-            { key: 'event_cooldown_ms', label: 'Event cooldown (ms)', hint: 'Minimum time between valid passes for the same drone.' },
-            { key: 'heartbeat_interval_ms', label: 'Heartbeat interval (ms)', hint: 'How often this node pings the Pi to prove it is alive. Keep this at 1000ms or higher — faster intervals multiply TCP connection churn and can cause "connection refused" errors on weak-signal boards without making the debug panel feel any more live (it already polls independently).' },
+        const FIELDS = [
+            { key: 'enter_rssi', label: 'Enter RSSI (dBm)' },
+            { key: 'exit_rssi', label: 'Exit RSSI (dBm)' },
+            { key: 'required_weak_samples', label: 'Required Weak Samples' },
+            { key: 'pass_timeout_ms', label: 'Pass Timeout (ms)' },
+            { key: 'event_cooldown_ms', label: 'Event Cooldown (ms)' },
+            { key: 'heartbeat_interval_ms', label: 'Heartbeat Interval (ms)' }
         ];
 
-        const nodeSelect = document.getElementById('nodeSelect');
-        const fieldGrid = document.getElementById('fieldGrid');
-        const overrideBadge = document.getElementById('overrideBadge');
-        const statusMsg = document.getElementById('statusMsg');
-        const resetBtn = document.getElementById('resetBtn');
+        async function initSettings() {
+            const res = await fetch('/api/settings');
+            const data = await res.json();
+            const select = document.getElementById('nodeSelect');
+            const nodes = Object.keys(data.nodes).sort();
+            select.innerHTML = nodes.map(n => `<option value="${n}">${n}</option>`).join('');
+            loadNodeSettings();
+        }
 
-        let currentData = null;
+        async function loadNodeSettings() {
+            const nodeId = document.getElementById('nodeSelect').value;
+            if (!nodeId) return;
 
-        function renderFields(values) {
-            fieldGrid.innerHTML = FIELD_META.map(f => `
-                <div class="field">
-                    <label for="f_${f.key}">${f.label}</label>
-                    <input type="number" id="f_${f.key}" name="${f.key}" value="${values[f.key]}">
-                    <div class="field-hint">${f.hint}</div>
+            const res = await fetch('/api/settings/' + encodeURIComponent(nodeId));
+            const settings = await res.json();
+
+            const grid = document.getElementById('fieldsGrid');
+            grid.innerHTML = FIELDS.map(f => `
+                <div class="form-group">
+                    <label class="form-label">${f.label}</label>
+                    <input type="number" id="f_${f.key}" class="form-control" value="${settings[f.key]}">
                 </div>
             `).join('');
         }
 
-        // clearStatus=false is used when reloading right after a save/reset,
-        // so the just-set confirmation message survives the refresh instead
-        // of being wiped out immediately.
-        async function loadAll(clearStatus = true) {
-            const res = await fetch('/api/settings');
-            currentData = await res.json();
-
-            const selected = nodeSelect.value;
-            const nodeIds = Object.keys(currentData.nodes).sort();
-            nodeSelect.innerHTML = nodeIds.map(id => `<option value="${id}">${id}</option>`).join('');
-            if (nodeIds.includes(selected)) nodeSelect.value = selected;
-
-            refreshFields(clearStatus);
-        }
-
-        function refreshFields(clearStatus) {
-            const nodeId = nodeSelect.value;
-            if (!nodeId || !currentData) return;
-            renderFields(currentData.nodes[nodeId]);
-            overrideBadge.style.display = currentData.overridden.includes(nodeId) ? 'inline-block' : 'none';
-            if (clearStatus) statusMsg.textContent = '';
-        }
-
-        nodeSelect.addEventListener('change', () => refreshFields(true));
-
-        document.getElementById('settingsForm').addEventListener('submit', async (ev) => {
-            ev.preventDefault();
-            const nodeId = nodeSelect.value;
-            if (!nodeId) return;
-
+        document.getElementById('settingsForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const nodeId = document.getElementById('nodeSelect').value;
             const payload = {};
-            FIELD_META.forEach(f => {
-                payload[f.key] = document.getElementById('f_' + f.key).value;
+            FIELDS.forEach(f => {
+                payload[f.key] = parseInt(document.getElementById('f_' + f.key).value, 10);
             });
 
-            statusMsg.textContent = 'Saving...';
-            statusMsg.className = 'settings-status';
+            const res = await fetch('/api/settings/' + encodeURIComponent(nodeId), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
 
-            try {
-                const res = await fetch('/api/settings/' + encodeURIComponent(nodeId), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const body = await res.json();
-                if (!res.ok) throw new Error(body.error || 'Save failed');
-
-                statusMsg.textContent = 'Saved — ' + nodeId + ' will pick this up on its next settings poll.';
-                statusMsg.className = 'settings-status ok';
-                await loadAll(false);
-            } catch (e) {
-                statusMsg.textContent = e.message;
-                statusMsg.className = 'settings-status err';
+            const status = document.getElementById('saveStatus');
+            if (res.ok) {
+                status.textContent = "Saved settings to " + nodeId;
+                status.style.color = "var(--accent-green)";
+            } else {
+                status.textContent = "Save failed";
+                status.style.color = "var(--accent-red)";
             }
         });
 
-        resetBtn.addEventListener('click', async () => {
-            const nodeId = nodeSelect.value;
-            if (!nodeId) return;
-
+        async function resetNodeSettings() {
+            const nodeId = document.getElementById('nodeSelect').value;
             await fetch('/api/settings/' + encodeURIComponent(nodeId), { method: 'DELETE' });
-            statusMsg.textContent = 'Reset to defaults.';
-            statusMsg.className = 'settings-status ok';
-            await loadAll(false);
-        });
+            loadNodeSettings();
+        }
 
-        loadAll();
+        initSettings();
     </script>
 </body>
 </html>
 """
 
-@app.route("/")
-def leaderboard():
-    return render_template_string(LEADERBOARD_PAGE, topbar_html=topbar("Leaderboard"))
+# -----------------------------------------------------------------------------
+# Flask Web Routes & API Endpoints
+# -----------------------------------------------------------------------------
 
-@app.route("/api/leaderboard")
-def api_leaderboard():
-    with events_lock:
-        # show most recent first
-        recent = list(reversed(events))
-    return jsonify({"events": recent, "count": len(events)})
+@app.route("/")
+def index():
+    return render_template_string(RACE_CONTROL_PAGE, topbar_html=topbar("Race Control"))
 
 @app.route("/radar")
-def radar():
+def radar_page():
     return render_template_string(RADAR_PAGE, topbar_html=topbar("Radar"))
 
-@app.route("/api/radar")
-def api_radar():
-    now = time.time()
+@app.route("/settings")
+def settings_page_route():
+    return render_template_string(SETTINGS_PAGE, topbar_html=topbar("Gate Settings"))
 
-    with events_lock:
-        known_nodes = sorted({e["node_id"] for e in events} | set(NODE_POSITIONS.keys()))
-
-    nodes = []
-    for node_id in known_nodes:
-        x, y = get_node_position(node_id)
-        nodes.append({"id": node_id, "x": round(x, 1), "y": round(y, 1)})
-
-    drones = []
-    with drone_state_lock:
-        for drone_id, state in list(drone_state.items()):
-            age = now - state["last_seen"]
-            if age > DRONE_TIMEOUT_S:
-                continue
-            x, y = get_node_position(state["node_id"])
-            # Fresher sightings render more opaque; fades out toward the timeout.
-            opacity = max(0.15, 1 - (age / DRONE_TIMEOUT_S))
-            # RSSI roughly -40 (very strong) to -90 (weak) -> 1.0 to 0.1 strength.
-            strength = max(0.1, min(1.0, (state["rssi"] + 90) / 50))
-            drones.append({
-                "id": drone_id,
-                "x": round(x, 1),
-                "y": round(y, 1),
-                "color": get_drone_color(drone_id),
-                "opacity": round(opacity, 2),
-                "strength": round(strength, 2),
-                "last_node": state["node_id"],
-                "rssi": state["rssi"],
-                "age": age,
-            })
-
-    return jsonify({"nodes": nodes, "drones": drones})
+# -----------------------------------------------------------------------------
+# ESP32 Checkpoint & Heartbeat Telemetry Ingestion
+# -----------------------------------------------------------------------------
 
 @app.route("/checkpoint", methods=["POST"])
 def checkpoint():
     data = request.get_json(force=True, silent=True)
     if not data or "node_id" not in data:
-        return jsonify({"error": "expected JSON with at least a node_id field"}), 400
+        return jsonify({"error": "expected JSON with node_id"}), 400
 
     node_id = data.get("node_id")
-    drone_id = str(data.get("drone_id", "1"))
+    raw_drone_id = data.get("drone_id")
+    drone_id = str(raw_drone_id) if raw_drone_id is not None else "1"
+
     try:
         rssi = int(data.get("rssi"))
     except (TypeError, ValueError):
         rssi = None
+
+    time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
     event = {
         "node_id": node_id,
         "drone_id": drone_id,
         "rssi": rssi if rssi is not None else "n/a",
         "timestamp": data.get("timestamp", "n/a"),
-        "received_at": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "received_at": time_str,
     }
 
     with events_lock:
@@ -1510,8 +1727,10 @@ def checkpoint():
     remember_drone(drone_id)
     record_contact(node_id, "checkpoint", drone_id=drone_id, rssi=event["rssi"])
 
-    print(f"[checkpoint] {event}")
-    return jsonify({"status": "ok", "event": event}), 200
+    race_res = process_race_checkpoint(node_id, drone_id, rssi, time_str)
+
+    print(f"[checkpoint] Node: {node_id} | Drone: {drone_id} | RSSI: {event['rssi']} | Event: {race_res}")
+    return jsonify({"status": "ok", "event": event, "race": race_res}), 200
 
 @app.route("/api/heartbeat", methods=["POST"])
 def heartbeat():
@@ -1522,57 +1741,218 @@ def heartbeat():
 
     wifi_rssi = data.get("wifi_rssi")
     extra = {"wifi_rssi": wifi_rssi, "fw_version": data.get("fw_version")}
-    # WiFi drop diagnostics - only sent by firmware that tracks them, so
-    # guard rather than clobbering with None on older firmware.
+
     if "disconnect_count" in data:
         extra["disconnect_count"] = data.get("disconnect_count")
         extra["last_disc_reason"] = data.get("last_disc_reason")
-    # Live drone-proximity fields are only present once a node has actually
-    # heard an ESP-NOW beacon - not every heartbeat carries them.
+
     if "drone_rssi" in data:
-        extra["drone_id"] = data.get("drone_id")
+        raw_d_id = data.get("drone_id")
+        d_id = str(raw_d_id) if raw_d_id is not None else "1"
+        extra["drone_id"] = d_id
         extra["drone_rssi"] = data.get("drone_rssi")
         extra["drone_age_ms"] = data.get("drone_age_ms")
-        remember_drone(data.get("drone_id"))
+        remember_drone(d_id)
 
-    # Newer firmware reports EVERY drone this node currently hears, which is
-    # what per-drone online status is built from.
     drone_array = data.get("drones")
     if isinstance(drone_array, list):
         extra["drones"] = drone_array
         for entry in drone_array:
             if isinstance(entry, dict):
-                remember_drone(entry.get("id"))
-                record_drone_sighting(node_id, entry.get("id"), entry.get("rssi"),
-                                      entry.get("age_ms"), from_array=True)
+                r_id = entry.get("id")
+                if r_id is not None:
+                    remember_drone(str(r_id))
+                    record_drone_sighting(node_id, str(r_id), entry.get("rssi"),
+                                          entry.get("age_ms"), from_array=True)
     elif "drone_rssi" in data:
-        # Legacy firmware: only one drone per heartbeat, so record it into
-        # its own slot rather than letting it overwrite the other drones.
-        record_drone_sighting(node_id, data.get("drone_id"), data.get("drone_rssi"),
+        raw_d_id = data.get("drone_id")
+        d_id = str(raw_d_id) if raw_d_id is not None else "1"
+        record_drone_sighting(node_id, d_id, data.get("drone_rssi"),
                               data.get("drone_age_ms"), from_array=False)
+
     record_contact(node_id, "heartbeat", **extra)
 
-    # Piggyback the node's current effective settings on the heartbeat
-    # response instead of making firmware run a second, separate polling
-    # task for /api/settings. Two concurrent HTTP tasks contending for one
-    # ESP32's single WiFi radio was causing periodic multi-second stalls -
-    # one request per heartbeat cycle does both jobs.
+    print(f"[heartbeat] Node: {node_id} | from {request.remote_addr} | wifi {wifi_rssi} dBm | fw {data.get('fw_version')}")
     return jsonify({"status": "ok", **get_effective_settings(node_id)}), 200
+
+@app.route("/api/leaderboard")
+def api_leaderboard():
+    with events_lock:
+        recent = list(reversed(events))
+    return jsonify({"events": recent, "count": len(events)})
+
+# -----------------------------------------------------------------------------
+# Race Control REST APIs
+# -----------------------------------------------------------------------------
+
+@app.route("/api/race/status", methods=["GET"])
+def api_race_status():
+    now = time.time()
+    with race_lock:
+        # Populate connected nodes list for main view
+        nodes_list = []
+        with node_registry_lock:
+            for n_id, n_state in sorted(node_registry.items()):
+                age = now - n_state["last_seen"]
+                nodes_list.append({
+                    "node_id": n_id,
+                    "online": age <= NODE_ONLINE_TIMEOUT_S,
+                    "ip": n_state.get("ip", "unknown"),
+                    "wifi_rssi": n_state.get("wifi_rssi")
+                })
+
+        # Ensure all known/seen drones exist in standings
+        with known_drone_lock:
+            for k_drone in known_drone_ids:
+                init_drone_for_race(k_drone)
+
+        standings = list(drone_race_data.values())
+
+        def standings_sort_key(d):
+            is_finished = d["status"] == "FINISHED"
+            fin_time = d["total_time"] if d["total_time"] is not None else 999999
+            laps = d["completed_laps"]
+            best = d["best_lap"] if d["best_lap"] is not None else 999999
+            return (0 if is_finished else 1, fin_time if is_finished else -laps, best)
+
+        sorted_standings = sorted(standings, key=standings_sort_key)
+
+        for s in sorted_standings:
+            s["color"] = get_drone_color(s["drone_id"])
+
+        logs = list(race_log)
+
+        with events_lock:
+            recent_events = list(reversed(events[:50]))
+            total_passes = len(events)
+
+        return jsonify({
+            "race": race_state,
+            "standings": sorted_standings,
+            "logs": logs,
+            "nodes": nodes_list,
+            "events": recent_events,
+            "total_passes": total_passes
+        })
+
+@app.route("/api/race/start", methods=["POST"])
+def api_race_start():
+    with race_lock:
+        race_state["status"] = "RUNNING"
+        race_state["start_time"] = time.time()
+        race_state["end_time"] = None
+        
+        for d_id, d_data in drone_race_data.items():
+            d_data["status"] = "RACING"
+            d_data["completed_laps"] = 0
+            d_data["next_gate_index"] = 0
+            d_data["last_gate"] = None
+            d_data["last_pass_time"] = None
+            d_data["lap_start_time"] = race_state["start_time"]
+            d_data["laps"] = []
+            d_data["best_lap"] = None
+            d_data["total_time"] = None
+            d_data["invalid_passes"] = 0
+
+        race_log.appendleft({
+            "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "ts": time.time(),
+            "type": "RACE_CONTROL",
+            "message": "TIMED RACE STARTED!",
+            "valid": True
+        })
+
+    return jsonify({"status": "ok", "race": race_state})
+
+@app.route("/api/race/stop", methods=["POST"])
+def api_race_stop():
+    with race_lock:
+        race_state["status"] = "STOPPED"
+        race_state["end_time"] = time.time()
+
+        race_log.appendleft({
+            "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "ts": time.time(),
+            "type": "RACE_CONTROL",
+            "message": "RACE STOPPED (Practice Mode Active)",
+            "valid": False
+        })
+
+    return jsonify({"status": "ok", "race": race_state})
+
+@app.route("/api/race/reset", methods=["POST"])
+def api_race_reset():
+    with race_lock:
+        race_state["status"] = "STOPPED"
+        race_state["start_time"] = None
+        race_state["end_time"] = None
+        drone_race_data.clear()
+        race_log.clear()
+
+    return jsonify({"status": "ok", "race": race_state})
+
+@app.route("/api/race/config", methods=["POST"])
+def api_race_config():
+    data = request.get_json(force=True, silent=True) or {}
+    with race_lock:
+        if "target_laps" in data:
+            try:
+                race_state["target_laps"] = max(1, int(data["target_laps"]))
+            except (TypeError, ValueError):
+                pass
+        if "enforce_gate_order" in data:
+            race_state["enforce_gate_order"] = bool(data["enforce_gate_order"])
+        if "gate_order" in data and isinstance(data["gate_order"], list):
+            cleaned_gates = [str(g).strip() for g in data["gate_order"] if str(g).strip()]
+            if cleaned_gates:
+                race_state["gate_order"] = cleaned_gates
+
+    return jsonify({"status": "ok", "race": race_state})
+
+# -----------------------------------------------------------------------------
+# Radar & Telemetry Debug APIs
+# -----------------------------------------------------------------------------
+
+@app.route("/api/radar")
+def api_radar():
+    now = time.time()
+    with events_lock:
+        known_nodes = sorted({e["node_id"] for e in events} | set(NODE_POSITIONS.keys()))
+
+    nodes = []
+    for node_id in known_nodes:
+        x, y = get_node_position(node_id)
+        nodes.append({"id": node_id, "x": round(x, 1), "y": round(y, 1)})
+
+    drones = []
+    with drone_state_lock:
+        for drone_id, state in list(drone_state.items()):
+            age = now - state["last_seen"]
+            if age > DRONE_TIMEOUT_S:
+                continue
+            x, y = get_node_position(state["node_id"])
+            drones.append({
+                "id": drone_id,
+                "x": round(x, 1),
+                "y": round(y, 1),
+                "color": get_drone_color(drone_id),
+                "last_node": state["node_id"],
+                "rssi": state["rssi"],
+                "age": age,
+            })
+
+    return jsonify({"nodes": nodes, "drones": drones})
 
 @app.route("/api/debug")
 def api_debug():
     now = time.time()
 
-    # Resolve drone sightings first, so each node row can list the drones it
-    # is actually hearing (by ID) and flag the ones it is closest to.
     with drone_sighting_lock:
         sightings = list(drone_sighting_registry.items())
 
     heard_by_node = defaultdict(list)
     best_by_drone = {}
     for (sighting_node, drone_id), s in sightings:
-        # age_ms was how stale the sample already was when the node sent it;
-        # add the time since we received that heartbeat so it ticks up live.
         sighting_age = s["age_ms"] + (now - s["last_seen"]) * 1000
         limit = DRONE_LIVE_TIMEOUT_MS if s["from_array"] else DRONE_LEGACY_TIMEOUT_MS
         if sighting_age > limit:
@@ -1597,17 +1977,11 @@ def api_debug():
         for node_id, state in sorted(node_registry.items()):
             age = now - state["last_seen"]
 
-            # drone_age_ms is how stale the sample already was when the
-            # node sent it; add time elapsed since the Pi received that
-            # heartbeat so this keeps counting up live between heartbeats,
-            # not just jump on each new one.
             drone_age_ms = state.get("drone_age_ms")
             live_drone_age_ms = None
             if drone_age_ms is not None:
                 live_drone_age_ms = drone_age_ms + age * 1000
 
-            # Drones this specific node is hearing, loudest first, each
-            # flagged if this node is the closest one to that drone.
             drones_heard = sorted(heard_by_node.get(node_id, []),
                                   key=lambda d: d["rssi"], reverse=True)
             for entry in drones_heard:
@@ -1631,16 +2005,10 @@ def api_debug():
                 "drones_heard": drones_heard,
             })
 
-    # A checkpoint has "live" drone proximity data if it heard an ESP-NOW
-    # sample recently - independent of whether that node's own heartbeat
-    # cadence still counts it "online" for connectivity purposes.
     live_nodes = [n for n in nodes if n["drone_age_ms"] is not None and n["drone_age_ms"] <= DRONE_LIVE_TIMEOUT_MS]
     closest_node = max(live_nodes, key=lambda n: n["drone_rssi"], default=None)
 
     with raw_log_lock:
-        # Merge every node's own capped buffer into one time-sorted list.
-        # Because each node has its own deque, a fast-heartbeating node
-        # can no longer push a slower node's entries out of the response.
         merged = [entry for entries in raw_log_by_node.values() for entry in entries]
 
     merged.sort(key=lambda e: e["ts"], reverse=True)
@@ -1657,7 +2025,6 @@ def api_debug():
     all_drone_ids |= set(best_by_drone.keys())
 
     def drone_sort_key(value):
-        # Numeric IDs sort naturally; anything else falls back to string.
         try:
             return (0, int(value), "")
         except (TypeError, ValueError):
@@ -1676,10 +2043,6 @@ def api_debug():
         })
 
     return jsonify({"nodes": nodes, "log": log, "drone": drone_status, "drones": drones})
-
-@app.route("/settings")
-def settings_page():
-    return render_template_string(SETTINGS_PAGE, topbar_html=topbar("Settings"))
 
 @app.route("/api/settings")
 def api_settings_all():
@@ -1703,7 +2066,6 @@ def api_settings_get(node_id):
 @app.route("/api/settings/<node_id>", methods=["POST"])
 def api_settings_set(node_id):
     data = request.get_json(force=True, silent=True) or {}
-
     cleaned = {}
     for key, (lo, hi) in SETTINGS_BOUNDS.items():
         if key not in data:
@@ -1734,15 +2096,27 @@ def api_settings_reset(node_id):
 def health():
     return jsonify({"status": "alive"}), 200
 
+def get_local_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't actually send packets; just picks the outbound interface.
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
 if __name__ == "__main__":
-    # Debug (auto-reload + Werkzeug debugger) is handy when running by hand,
-    # but the boot service sets KWAD_DEBUG=0 so the interactive debugger
-    # isn't left exposed on 0.0.0.0 on every power-on.
     debug_mode = os.environ.get("KWAD_DEBUG", "1") != "0"
 
-    # 0.0.0.0 so ESP32s on the same WiFi can reach it, not just localhost.
-    # threaded=True is required once more than one node is talking to the
-    # Pi: Flask's dev server handles one request at a time by default, so
-    # concurrent heartbeats/checkpoints from multiple ESP32s start seeing
-    # "connection refused" / "read Timeout" as they queue up and time out.
+    local_ip = get_local_ip()
+    print("=" * 60)
+    print(f" kwad race control v{APP_VERSION}")
+    print(f" Serving on http://{local_ip}:5000  (and http://127.0.0.1:5000)")
+    print(f" Nodes must POST to this IP. Firmware currently targets the")
+    print(f" IP set as PI_IP in the .ino files - make sure it matches {local_ip}.")
+    print("=" * 60)
+
     app.run(host="0.0.0.0", port=5000, debug=debug_mode, threaded=True)
