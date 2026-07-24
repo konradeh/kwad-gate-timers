@@ -1,3 +1,10 @@
+// ============================================================
+//  DRONE 1  --  flash this sketch to the drone 1 beacon board
+// ------------------------------------------------------------
+//  This is the CANONICAL copy. drone2/ and drone3/ are identical
+//  except for DRONE_ID, so any change made here must be copied to
+//  those two as well.
+// ============================================================
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
